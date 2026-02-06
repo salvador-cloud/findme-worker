@@ -1,13 +1,10 @@
-fastapi==0.110.0
-uvicorn==0.27.1
-
 supabase==2.3.4
 
 numpy==1.26.4
-opencv-python==4.9.0.80
+opencv-python-headless==4.9.0.80
 scikit-learn==1.4.1.post1
 
-# Pin explícito para evitar que pip termine en scipy==1.6.1 (source build)
+# Pin explícito para evitar builds raros/antiguos de scipy
 scipy==1.11.4
 
 insightface==0.7.3
