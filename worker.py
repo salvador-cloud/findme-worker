@@ -5,8 +5,10 @@ import logging
 from typing import List, Optional
 
 import numpy as np
-from supabase import create_client, Client
+import requests
+import cv2
 
+from supabase import create_client, Client
 from insightface.app import FaceAnalysis
 from sklearn.cluster import DBSCAN
 
@@ -22,157 +24,192 @@ logger = logging.getLogger("findme-worker")
 
 
 # -----------------------
-# Env
+# ENV
 # -----------------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "10"))
 
-# Para DBSCAN
 DBSCAN_EPS = float(os.environ.get("DBSCAN_EPS", "0.35"))
 DBSCAN_MIN_SAMPLES = int(os.environ.get("DBSCAN_MIN_SAMPLES", "2"))
 
 
-# -----------------------
-# Helpers
-# -----------------------
-def require_env(name: str, value: str) -> None:
+def require_env(name: str, value: str):
     if not value:
-        raise RuntimeError(f"Missing required env var: {name}")
+        raise RuntimeError(f"Missing env var: {name}")
 
 
-def parse_embeddings(rows: List[dict], field_name: str = "embedding") -> np.ndarray:
-    """
-    Espera embeddings guardados como:
-    - list[float]
-    - string JSON "[...]" (por ejemplo guardado como text)
-    """
-    emb_list = []
-    for r in rows:
-        v = r.get(field_name)
-        if v is None:
-            continue
-        if isinstance(v, list):
-            emb_list.append(v)
-        elif isinstance(v, str):
-            emb_list.append(json.loads(v))
-        else:
-            # fallback: intentar convertir
-            emb_list.append(list(v))
-    return np.array(emb_list, dtype=np.float32)
+def normalize_embedding(emb: np.ndarray):
+    emb = emb.astype(np.float32)
+    norm = np.linalg.norm(emb)
+    if norm > 0:
+        emb = emb / norm
+    return emb.tolist()
 
 
-def run_dbscan(embeddings: np.ndarray) -> np.ndarray:
+def run_dbscan(embeddings: np.ndarray):
     if embeddings.size == 0:
         return np.array([], dtype=np.int32)
     clustering = DBSCAN(eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES, metric="cosine")
-    labels = clustering.fit_predict(embeddings)
-    return labels.astype(np.int32)
+    return clustering.fit_predict(embeddings).astype(np.int32)
 
 
-# -----------------------
-# Core worker
-# -----------------------
 class FindMeWorker:
-    def __init__(self) -> None:
+
+    def __init__(self):
         require_env("SUPABASE_URL", SUPABASE_URL)
         require_env("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY)
 
         self.sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-        # InsightFace model init (CPU)
-        # name="buffalo_l" es el default clásico para FaceAnalysis
-        # det_size: ajuste típico, podés tunear performance vs precisión
         self.face_app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
         self.face_app.prepare(ctx_id=0, det_size=(640, 640))
 
-        logger.info("Worker initialized. Poll every %ss | DBSCAN eps=%s min_samples=%s",
-                    POLL_SECONDS, DBSCAN_EPS, DBSCAN_MIN_SAMPLES)
+        logger.info("Worker ready")
 
-    def fetch_pending_jobs(self) -> List[dict]:
-        """
-        Ajustá a tu esquema real de tabla/estado.
-        En tu MVP asumimos una tabla 'jobs' con status='pending'
-        """
+    def fetch_pending_jobs(self):
         resp = (
             self.sb.table("jobs")
             .select("*")
             .eq("status", "pending")
-            .limit(10)
+            .limit(5)
             .execute()
         )
         return resp.data or []
 
-    def mark_job(self, job_id: str, status: str, error: Optional[str] = None) -> None:
+    def mark_job(self, job_id, status, error=None, result=None):
         payload = {"status": status}
         if error:
-            payload["error"] = error[:1000]
+            payload["error"] = error[:2000]
+        if result:
+            payload["result"] = result
+
         self.sb.table("jobs").update(payload).eq("id", job_id).execute()
 
-    def process_job(self, job: dict) -> None:
-        """
-        OJO: esta parte depende de tu esquema real:
-        - de dónde vienen las imágenes
-        - cómo guardás embeddings
-        - cómo escribís clusters
-        """
-        job_id = str(job.get("id"))
-        logger.info("Processing job id=%s", job_id)
+    def fetch_photos(self, album_id):
+        resp = (
+            self.sb.table("photos")
+            .select("id,url")
+            .eq("album_id", album_id)
+            .execute()
+        )
+        return resp.data or []
+
+    def download_image(self, url):
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        data = np.frombuffer(r.content, dtype=np.uint8)
+        img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        if img is None:
+            raise RuntimeError("Image decode failed")
+        return img
+
+    def process_job(self, job):
+
+        job_id = job["id"]
+        album_id = job["album_id"]
+
+        logger.info("Processing job %s", job_id)
         self.mark_job(job_id, "processing")
 
         try:
-            # Ejemplo: leer faces/embeddings ya calculados en otra tabla
-            # Si tu pipeline aún no tiene embeddings, este worker debería:
-            # 1) bajar imagen
-            # 2) detectar caras con self.face_app.get(...)
-            # 3) extraer embedding
-            # 4) guardar embedding
-            # 5) clusterizar
-            #
-            # Para no inventar endpoints/storage aquí, dejamos el ejemplo con embeddings existentes.
-            faces_resp = (
-                self.sb.table("photo_faces")
-                .select("id, embedding")
+            photos = self.fetch_photos(album_id)
+
+            if not photos:
+                raise RuntimeError("No photos found")
+
+            # ------------------------
+            # 1) Generate embeddings
+            # ------------------------
+            for p in photos:
+
+                photo_id = p["id"]
+                url = p["url"]
+
+                img = self.download_image(url)
+                faces = self.face_app.get(img)
+
+                if not faces:
+                    continue
+
+                best_face = max(
+                    faces,
+                    key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])
+                )
+
+                emb = normalize_embedding(best_face.embedding)
+
+                self.sb.table("photo_embeddings").upsert(
+                    {
+                        "photo_id": photo_id,
+                        "job_id": job_id,
+                        "embedding": emb,
+                    },
+                    on_conflict="photo_id,job_id",
+                ).execute()
+
+            # ------------------------
+            # 2) Fetch embeddings
+            # ------------------------
+            resp = (
+                self.sb.table("photo_embeddings")
+                .select("photo_id,embedding")
                 .eq("job_id", job_id)
                 .execute()
             )
-            faces = faces_resp.data or []
-            if not faces:
-                raise RuntimeError("No faces/embeddings found for this job")
 
-            embeddings = parse_embeddings(faces, field_name="embedding")
+            rows = resp.data or []
+
+            if not rows:
+                raise RuntimeError("No embeddings generated")
+
+            embeddings = np.array(
+                [json.loads(r["embedding"]) if isinstance(r["embedding"], str) else r["embedding"]
+                 for r in rows],
+                dtype=np.float32,
+            )
+
             labels = run_dbscan(embeddings)
 
-            # Guardar label por face
-            for face, label in zip(faces, labels):
-                self.sb.table("photo_faces").update(
-                    {"cluster_id": int(label)}
-                ).eq("id", face["id"]).execute()
+            # ------------------------
+            # 3) Update clusters
+            # ------------------------
+            for row, label in zip(rows, labels):
 
-            self.mark_job(job_id, "done")
-            logger.info("Job done id=%s | faces=%s", job_id, len(faces))
+                self.sb.table("photo_faces").upsert(
+                    {
+                        "photo_id": row["photo_id"],
+                        "cluster_id": int(label),
+                    },
+                    on_conflict="photo_id",
+                ).execute()
+
+            summary = {
+                "photos": len(rows),
+                "clusters": len(set(labels.tolist())),
+            }
+
+            self.mark_job(job_id, "done", result=summary)
+            logger.info("Job done %s", summary)
 
         except Exception as e:
-            logger.exception("Job failed id=%s", job_id)
+            logger.exception("Job failed")
             self.mark_job(job_id, "error", error=str(e))
 
-    def run_forever(self) -> None:
+    def run(self):
         while True:
             try:
                 jobs = self.fetch_pending_jobs()
-                if jobs:
-                    logger.info("Pending jobs: %s", len(jobs))
                 for job in jobs:
                     self.process_job(job)
             except Exception:
-                logger.exception("Loop error (will continue)")
-
+                logger.exception("Loop error")
             time.sleep(POLL_SECONDS)
 
 
-def main() -> None:
+def main():
     w = FindMeWorker()
-    w.run_forever()
+    w.run()
 
 
 if __name__ == "__main__":
