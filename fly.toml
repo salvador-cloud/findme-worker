@@ -1,0 +1,20 @@
+app = "findme-worker-gld7ka"
+primary_region = "mad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  POLL_SECONDS = "10"
+  DBSCAN_EPS = "0.35"
+  DBSCAN_MIN_SAMPLES = "2"
+
+# Worker puro: sin [http_service] ni [[services]]
+# Fly mantiene la machine viva mientras el proceso (python worker.py) siga corriendo.
+
+[processes]
+  app = "python -u worker.py"
+
+kill_signal = "SIGINT"
+kill_timeout = "30s"
+
