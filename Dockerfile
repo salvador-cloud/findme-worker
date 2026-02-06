@@ -1,31 +1,57 @@
-FROM python:3.10
+FROM python:3.10-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
+# Dependencias del sistema:
+# - libgomp1: requerido por sklearn/numpy en muchos builds
+# - libgl1 + libglib2.0-0: necesarios si alguna lib intenta cargar OpenCV (aunque usemos headless, prefiero blindar)
+# - prelink: provee execstack para limpiar el flag "executable stack" en el .so de onnxruntime
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
+    libgomp1 \
     libgl1 \
     libglib2.0-0 \
-    libgomp1 \
-    patchelf \
-    && rm -rf /var/lib/apt/lists/*
+    prelink \
+  && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt /app/requirements.txt
 
-# Patch execstack flag in onnxruntime shared library (Fly/Firecracker constraint)
-RUN python -c "import site,os,glob; \
-paths=[]; \
-[paths.extend(glob.glob(os.path.join(p,'onnxruntime','capi','onnxruntime_pybind11_state*.so'))) for p in site.getsitepackages()]; \
-print('\\n'.join(paths)) if paths else None; \
-exit(0 if paths else 1)" \
- && for f in $(python -c "import site,os,glob; \
-paths=[]; \
-[paths.extend(glob.glob(os.path.join(p,'onnxruntime','capi','onnxruntime_pybind11_state*.so'))) for p in site.getsitepackages()]; \
-print(' '.join(paths))"); do \
-      patchelf --clear-execstack "$f"; \
-    done
+RUN python -m pip install --upgrade pip setuptools wheel \
+  && pip install -r /app/requirements.txt
 
-COPY . .
+# FIX CRÍTICO: onnxruntime trae un .so que pide "executable stack" y Fly lo bloquea.
+# Esto limpia el flag y evita el crash al importar.
+RUN python - << 'PY'
+import os, site, glob, subprocess
+
+paths = []
+for sp in site.getsitepackages():
+    paths.extend(glob.glob(os.path.join(sp, "onnxruntime", "capi", "*.so")))
+
+# En algunos layouts el .so vive en subpaths
+for sp in site.getsitepackages():
+    paths.extend(glob.glob(os.path.join(sp, "onnxruntime", "**", "*.so"), recursive=True))
+
+paths = sorted(set(paths))
+
+if not paths:
+    raise SystemExit("ERROR: No se encontraron .so de onnxruntime para aplicar execstack -c")
+
+print("Encontrados .so de onnxruntime:")
+for p in paths:
+    print(" -", p)
+
+for p in paths:
+    # execstack -c limpia el bit de executable stack
+    subprocess.run(["execstack", "-c", p], check=False)
+
+print("execstack -c aplicado.")
+PY
+
+COPY . /app
 
 CMD ["python", "-u", "worker.py"]
