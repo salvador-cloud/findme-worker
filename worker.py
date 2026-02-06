@@ -131,7 +131,7 @@ class FindMeWorker:
             #
             # Para no inventar endpoints/storage aquí, dejamos el ejemplo con embeddings existentes.
             faces_resp = (
-                self.sb.table("faces")
+                self.sb.table("photo_faces")
                 .select("id, embedding")
                 .eq("job_id", job_id)
                 .execute()
@@ -145,7 +145,7 @@ class FindMeWorker:
 
             # Guardar label por face
             for face, label in zip(faces, labels):
-                self.sb.table("faces").update(
+                self.sb.table("photo_faces").update(
                     {"cluster_id": int(label)}
                 ).eq("id", face["id"]).execute()
 
