@@ -3,7 +3,7 @@ import time
 import json
 import logging
 from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any
 
 import numpy as np
 import requests
@@ -51,6 +51,31 @@ def utc_now_iso() -> str:
 def require_env(name: str, value: str) -> None:
     if not value:
         raise RuntimeError(f"Missing required env var: {name}")
+
+
+def clamp_int(x: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, x))
+
+
+def normalize_progress_to_int(progress: Optional[float]) -> Optional[int]:
+    """
+    albums.progress es INTEGER.
+    - si progress viene en 0..1 => lo pasamos a 0..100
+    - si progress viene en 0..100 => lo dejamos
+    - siempre devuelve int clamp 0..100
+    """
+    if progress is None:
+        return None
+    try:
+        p = float(progress)
+    except Exception:
+        return None
+
+    # Heurística: si es <= 1.0 asumimos ratio
+    if p <= 1.0:
+        p = p * 100.0
+
+    return clamp_int(int(round(p)), 0, 100)
 
 
 def to_public_storage_url(storage_path: str) -> str:
@@ -169,15 +194,26 @@ class FindMeWorker:
             payload["error"] = error[:1500]
         self.sb.table("jobs").update(payload).eq("id", job_id).execute()
 
-    def update_album(self, album_id: str, status: str, progress: Optional[float] = None,
-                     error_message: Optional[str] = None, completed: bool = False) -> None:
+    def update_album(
+        self,
+        album_id: str,
+        status: str,
+        progress: Optional[float] = None,
+        error_message: Optional[str] = None,
+        completed: bool = False,
+    ) -> None:
         payload: Dict[str, Any] = {"status": status}
-        if progress is not None:
-            payload["progress"] = float(progress)
+
+        p_int = normalize_progress_to_int(progress)
+        if p_int is not None:
+            payload["progress"] = p_int  # INTEGER 0..100
+
         if error_message is not None:
             payload["error_message"] = error_message[:1500]
+
         if completed:
             payload["completed_at"] = utc_now_iso()
+
         self.sb.table("albums").update(payload).eq("id", album_id).execute()
 
     def fetch_photos(self, album_id: str) -> List[dict]:
@@ -196,19 +232,23 @@ class FindMeWorker:
     def upsert_face_embedding(self, photo_id: str, album_id: str, embedding: List[float], bbox: List[float]) -> None:
         # En tu tabla face_embeddings NO hay id, así que hacemos delete+insert por foto+album para evitar duplicados
         self.sb.table("face_embeddings").delete().eq("photo_id", photo_id).eq("album_id", album_id).execute()
-        self.sb.table("face_embeddings").insert({
-            "photo_id": photo_id,
-            "album_id": album_id,
-            "embedding": embedding,
-            "bbox": bbox,
-        }).execute()
+        self.sb.table("face_embeddings").insert(
+            {
+                "photo_id": photo_id,
+                "album_id": album_id,
+                "embedding": embedding,
+                "bbox": bbox,
+            }
+        ).execute()
 
     def insert_photo_embedding(self, photo_id: str, job_id: str, embedding: List[float]) -> None:
-        self.sb.table("photo_embeddings").insert({
-            "photo_id": photo_id,
-            "job_id": job_id,
-            "embedding": embedding,
-        }).execute()
+        self.sb.table("photo_embeddings").insert(
+            {
+                "photo_id": photo_id,
+                "job_id": job_id,
+                "embedding": embedding,
+            }
+        ).execute()
 
     def clear_photo_faces_for_album(self, album_id: str) -> None:
         # photo_faces solo tiene photo_id, cluster_id, created_at
@@ -218,10 +258,12 @@ class FindMeWorker:
             self.sb.table("photo_faces").delete().eq("photo_id", p["id"]).execute()
 
     def create_cluster(self, album_id: str, thumbnail_url: Optional[str]) -> str:
-        resp = self.sb.table("face_clusters").insert({
-            "album_id": album_id,
-            "thumbnail_url": thumbnail_url,
-        }).execute()
+        resp = self.sb.table("face_clusters").insert(
+            {
+                "album_id": album_id,
+                "thumbnail_url": thumbnail_url,
+            }
+        ).execute()
         data = resp.data or []
         if not data:
             raise RuntimeError("Could not create face_cluster")
@@ -230,10 +272,12 @@ class FindMeWorker:
     def insert_photo_face(self, photo_id: str, cluster_id: str) -> None:
         # idempotencia: borramos y reinsertamos
         self.sb.table("photo_faces").delete().eq("photo_id", photo_id).execute()
-        self.sb.table("photo_faces").insert({
-            "photo_id": photo_id,
-            "cluster_id": cluster_id,
-        }).execute()
+        self.sb.table("photo_faces").insert(
+            {
+                "photo_id": photo_id,
+                "cluster_id": cluster_id,
+            }
+        ).execute()
 
     # -----------------------
     # Core processing
@@ -252,7 +296,7 @@ class FindMeWorker:
 
         # Marcar estados
         self.mark_job(job_id, "processing")
-        self.update_album(album_id, status="processing", progress=0.01, error_message=None, completed=False)
+        self.update_album(album_id, status="processing", progress=1, error_message=None, completed=False)
 
         try:
             photos = self.fetch_photos(album_id)
@@ -293,9 +337,11 @@ class FindMeWorker:
                 except Exception as e:
                     logger.warning("Photo failed id=%s path=%s err=%s", photo_id, storage_path, str(e))
 
-                # progreso incremental
-                prog = min(0.60, 0.05 + (processed / max(1, total)) * 0.55)
-                self.update_album(album_id, status="processing", progress=prog)
+                # progreso incremental: 1..60 durante embeddings
+                # sube de 5 a 60 aprox según avance
+                prog_ratio = processed / max(1, total)
+                prog_int = clamp_int(int(round(5 + prog_ratio * 55)), 1, 60)
+                self.update_album(album_id, status="processing", progress=prog_int)
 
             if processed == 0:
                 raise RuntimeError(f"No embeddings generated. Photos={total}, no_face={no_face}")
@@ -313,6 +359,9 @@ class FindMeWorker:
 
             embeddings = parse_embeddings(pe, field_name="embedding")
             labels = run_dbscan(embeddings)
+
+            # En clustering, marcamos progreso 70 antes de escribir clusters
+            self.update_album(album_id, status="processing", progress=70)
 
             # 3) Crear clusters + asignar photo_faces
             # Limpiamos mappings previos
@@ -358,6 +407,11 @@ class FindMeWorker:
 
                 assigned += 1
 
+                # progreso 70..95 mientras asignamos
+                prog_ratio = assigned / max(1, len(pe))
+                prog_int = clamp_int(int(round(70 + prog_ratio * 25)), 70, 95)
+                self.update_album(album_id, status="processing", progress=prog_int)
+
             # 4) Finalizar
             result = {
                 "album_id": album_id,
@@ -370,14 +424,14 @@ class FindMeWorker:
                 "dbscan": {"eps": DBSCAN_EPS, "min_samples": DBSCAN_MIN_SAMPLES},
             }
 
-            self.update_album(album_id, status="completed", progress=1.0, completed=True)
+            self.update_album(album_id, status="completed", progress=100, completed=True)
             self.mark_job(job_id, "done", result=result)
             logger.info("Job done %s result=%s", job_id, result)
 
         except Exception as e:
             logger.exception("Job failed %s", job_id)
             # dejar album en error
-            self.update_album(album_id, status="error", progress=0.0, error_message=str(e), completed=False)
+            self.update_album(album_id, status="error", progress=0, error_message=str(e), completed=False)
             self.mark_job(job_id, "error", error=str(e))
 
     def run_forever(self) -> None:
