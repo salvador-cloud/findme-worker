@@ -7,5 +7,8 @@ numpy==1.26.4
 opencv-python==4.9.0.80
 scikit-learn==1.4.1.post1
 
+# Pin explícito para evitar que pip termine en scipy==1.6.1 (source build)
+scipy==1.11.4
+
 insightface==0.7.3
 onnxruntime==1.16.3
