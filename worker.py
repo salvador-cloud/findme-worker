@@ -47,6 +47,11 @@ HTTP_TIMEOUT_SECONDS = int(os.environ.get("HTTP_TIMEOUT_SECONDS", "30"))
 FACE_THUMB_SIZE = int(os.environ.get("FACE_THUMB_SIZE", "320"))  # max side length
 FACE_PAD_RATIO = float(os.environ.get("FACE_PAD_RATIO", "0.30"))  # bbox padding
 
+# Merge tuning (post DBSCAN)
+MERGE_CENTROID_COS = float(os.environ.get("MERGE_CENTROID_COS", "0.60"))
+MERGE_BESTPAIR_COS = float(os.environ.get("MERGE_BESTPAIR_COS", "0.70"))
+MAX_FACES_PER_CLUSTER_FOR_PAIRWISE = int(os.environ.get("MAX_FACES_PER_CLUSTER_FOR_PAIRWISE", "40"))
+
 
 # -----------------------
 # Helpers
@@ -172,6 +177,137 @@ def crop_face_thumb(img_bgr: np.ndarray, bbox: List[float]) -> bytes:
 
 
 # -----------------------
+# Merge helpers (post-DBSCAN)
+# -----------------------
+def l2_normalize(v: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(v))
+    if n <= 0:
+        return v
+    return v / n
+
+
+def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    a = l2_normalize(a)
+    b = l2_normalize(b)
+    return float(np.dot(a, b))
+
+
+def build_clusters_from_labels(faces_rows: List[Dict[str, Any]], labels: np.ndarray) -> Dict[int, List[int]]:
+    """
+    label -> list of indices in faces_rows
+    (solo labels != -1)
+    """
+    clusters: Dict[int, List[int]] = {}
+    for idx, lab in enumerate(labels.tolist()):
+        lab_int = int(lab)
+        if lab_int == -1:
+            continue
+        clusters.setdefault(lab_int, []).append(idx)
+    return clusters
+
+
+def compute_centroid(embs: np.ndarray, idxs: List[int]) -> np.ndarray:
+    c = np.mean(embs[idxs, :], axis=0)
+    return l2_normalize(c)
+
+
+def best_pair_cosine(embs: np.ndarray, idxs_a: List[int], idxs_b: List[int]) -> float:
+    """
+    Máxima similitud entre cualquier embedding de A y cualquiera de B.
+    Submuestrea para no explotar CPU.
+    """
+    a = idxs_a[:MAX_FACES_PER_CLUSTER_FOR_PAIRWISE]
+    b = idxs_b[:MAX_FACES_PER_CLUSTER_FOR_PAIRWISE]
+    best = -1.0
+    for i in a:
+        vi = l2_normalize(embs[i])
+        for j in b:
+            vj = l2_normalize(embs[j])
+            s = float(np.dot(vi, vj))
+            if s > best:
+                best = s
+    return best
+
+
+def cluster_photo_set(faces_rows: List[Dict[str, Any]], idxs: List[int]) -> set:
+    return {str(faces_rows[i]["photo_id"]) for i in idxs}
+
+
+def merge_clusters(
+    faces_rows: List[Dict[str, Any]],
+    embs: np.ndarray,
+    labels: np.ndarray,
+) -> np.ndarray:
+    """
+    Une clusters DBSCAN si parecen la misma persona.
+    Anti-merge duro: si dos clusters aparecen en la MISMA foto => no pueden ser la misma persona.
+    Esto evita merges falsos (dos personas distintas co-ocurrentes).
+    """
+    clusters = build_clusters_from_labels(faces_rows, labels)
+    if len(clusters) <= 1:
+        return labels
+
+    centroids: Dict[int, np.ndarray] = {}
+    photosets: Dict[int, set] = {}
+    for lab, idxs in clusters.items():
+        centroids[lab] = compute_centroid(embs, idxs)
+        photosets[lab] = cluster_photo_set(faces_rows, idxs)
+
+    # union-find
+    parent = {lab: lab for lab in clusters.keys()}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    labs = sorted(clusters.keys())
+    for i in range(len(labs)):
+        for j in range(i + 1, len(labs)):
+            a, b = labs[i], labs[j]
+
+            # Anti-merge: si comparten alguna photo_id, son dos personas distintas en la misma foto
+            if len(photosets[a].intersection(photosets[b])) > 0:
+                continue
+
+            c_sim = cosine_sim(centroids[a], centroids[b])
+            if c_sim < MERGE_CENTROID_COS:
+                continue
+
+            bp = best_pair_cosine(embs, clusters[a], clusters[b])
+            if bp < MERGE_BESTPAIR_COS:
+                continue
+
+            union(a, b)
+
+    # map root -> new compact label
+    root_to_new: Dict[int, int] = {}
+    old_to_new: Dict[int, int] = {}
+    next_id = 0
+    for lab in labs:
+        r = find(lab)
+        if r not in root_to_new:
+            root_to_new[r] = next_id
+            next_id += 1
+        old_to_new[lab] = root_to_new[r]
+
+    new_labels = labels.copy()
+    for idx, lab in enumerate(labels.tolist()):
+        lab_int = int(lab)
+        if lab_int == -1:
+            continue
+        new_labels[idx] = old_to_new[lab_int]
+
+    return new_labels.astype(np.int32)
+
+
+# -----------------------
 # Core worker
 # -----------------------
 class FindMeWorker:
@@ -186,11 +322,13 @@ class FindMeWorker:
         self.face_app.prepare(ctx_id=0, det_size=(640, 640))
 
         logger.info(
-            "Worker initialized. Poll=%ss | DBSCAN eps=%s min_samples=%s | bucket=%s",
+            "Worker initialized. Poll=%ss | DBSCAN eps=%s min_samples=%s | bucket=%s | merge centroid=%s bestpair=%s",
             POLL_SECONDS,
             DBSCAN_EPS,
             DBSCAN_MIN_SAMPLES,
             SUPABASE_PUBLIC_BUCKET,
+            MERGE_CENTROID_COS,
+            MERGE_BESTPAIR_COS,
         )
 
     # -----------------------
@@ -280,6 +418,7 @@ class FindMeWorker:
         ).execute()
 
     def insert_face_embedding_row(self, face_id: str, photo_id: str, album_id: str, embedding: List[float], bbox: List[float]) -> None:
+        # Nota: requiere que face_embeddings tenga columna "id".
         self.sb.table("face_embeddings").insert(
             {
                 "id": face_id,
@@ -415,7 +554,10 @@ class FindMeWorker:
                     faces = self.face_app.get(img) or []
 
                     # filtrar caras sin embedding
-                    faces = [f for f in faces if getattr(f, "embedding", None) is not None and getattr(f, "bbox", None) is not None]
+                    faces = [
+                        f for f in faces
+                        if getattr(f, "embedding", None) is not None and getattr(f, "bbox", None) is not None
+                    ]
 
                     if not faces:
                         photos_no_face += 1
@@ -468,10 +610,12 @@ class FindMeWorker:
             embeddings = np.array([r["embedding"] for r in faces_rows], dtype=np.float32)
             labels = run_dbscan(embeddings)
 
+            # 2b) Merge inteligente post-DBSCAN (reduce split frontal vs perfil)
+            labels = merge_clusters(faces_rows, embeddings, labels)
+
             self.update_album(album_id, status="processing", progress=70)
 
             # 3) Crear clusters + asignar photo_faces
-            # label -> cluster_id
             cluster_map: Dict[int, str] = {}
 
             unique_labels = sorted({int(x) for x in labels.tolist() if int(x) != -1})
@@ -487,7 +631,6 @@ class FindMeWorker:
                 cluster_id = self.create_cluster(album_id=album_id, thumbnail_url=thumb_url)
                 cluster_map[lab] = cluster_id
 
-            # Asignación many-to-many por cara -> cluster; luego mapear a photo_faces
             assigned_faces = 0
             noise_faces = 0
 
@@ -523,6 +666,11 @@ class FindMeWorker:
                 "faces_noise": noise_faces,
                 "clusters": len(unique_labels) + noise_faces,  # noise crea cluster propio
                 "dbscan": {"eps": DBSCAN_EPS, "min_samples": DBSCAN_MIN_SAMPLES},
+                "merge": {
+                    "centroid_cos": MERGE_CENTROID_COS,
+                    "bestpair_cos": MERGE_BESTPAIR_COS,
+                    "max_pairwise": MAX_FACES_PER_CLUSTER_FOR_PAIRWISE,
+                },
             }
 
             self.update_album(album_id, status="completed", progress=100, completed=True)
