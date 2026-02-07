@@ -6,7 +6,7 @@ import io
 import zipfile
 from uuid import uuid4
 from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 import numpy as np
 import requests
@@ -40,8 +40,12 @@ DBSCAN_EPS = float(os.environ.get("DBSCAN_EPS", "0.35"))
 DBSCAN_MIN_SAMPLES = int(os.environ.get("DBSCAN_MIN_SAMPLES", "2"))
 
 # Storage
-SUPABASE_PUBLIC_BUCKET = os.environ.get("SUPABASE_PUBLIC_BUCKET", "uploads")  # tu bucket público: uploads
+SUPABASE_PUBLIC_BUCKET = os.environ.get("SUPABASE_PUBLIC_BUCKET", "uploads")
 HTTP_TIMEOUT_SECONDS = int(os.environ.get("HTTP_TIMEOUT_SECONDS", "30"))
+
+# Face thumbnails tuning
+FACE_THUMB_SIZE = int(os.environ.get("FACE_THUMB_SIZE", "320"))  # max side length
+FACE_PAD_RATIO = float(os.environ.get("FACE_PAD_RATIO", "0.30"))  # bbox padding
 
 
 # -----------------------
@@ -62,10 +66,9 @@ def clamp_int(x: int, lo: int, hi: int) -> int:
 
 def normalize_progress_to_int(progress: Optional[float]) -> Optional[int]:
     """
-    albums.progress es INTEGER.
+    albums.progress es INTEGER (0..100).
     - si progress viene en 0..1 => lo pasamos a 0..100
     - si progress viene en 0..100 => lo dejamos
-    - siempre devuelve int clamp 0..100
     """
     if progress is None:
         return None
@@ -74,7 +77,6 @@ def normalize_progress_to_int(progress: Optional[float]) -> Optional[int]:
     except Exception:
         return None
 
-    # Heurística: si es <= 1.0 asumimos ratio
     if p <= 1.0:
         p = p * 100.0
 
@@ -82,19 +84,12 @@ def normalize_progress_to_int(progress: Optional[float]) -> Optional[int]:
 
 
 def to_public_storage_url(storage_path: str) -> str:
-    """
-    Como el bucket 'uploads' es público:
-    https://<PROJECT>.supabase.co/storage/v1/object/public/uploads/<storage_path>
-    """
     base = SUPABASE_URL.rstrip("/")
     path = storage_path.lstrip("/")
     return f"{base}/storage/v1/object/public/{SUPABASE_PUBLIC_BUCKET}/{path}"
 
 
 def download_image(url: str) -> np.ndarray:
-    """
-    Descarga imagen y la decodifica a BGR (OpenCV).
-    """
     r = requests.get(url, timeout=HTTP_TIMEOUT_SECONDS)
     r.raise_for_status()
     data = np.frombuffer(r.content, dtype=np.uint8)
@@ -104,30 +99,7 @@ def download_image(url: str) -> np.ndarray:
     return img
 
 
-def pick_primary_face(faces: List[Any]) -> Optional[Any]:
-    """
-    Si hay múltiples caras, elegimos la "principal" por área de bbox.
-    """
-    if not faces:
-        return None
-    best = None
-    best_area = -1.0
-    for f in faces:
-        # f.bbox: [x1,y1,x2,y2]
-        x1, y1, x2, y2 = [float(v) for v in f.bbox]
-        area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
-        if area > best_area:
-            best_area = area
-            best = f
-    return best
-
-
 def parse_embeddings(rows: List[dict], field_name: str = "embedding") -> np.ndarray:
-    """
-    Espera embeddings guardados como:
-    - list[float]
-    - string JSON "[...]" (por ejemplo guardado como text)
-    """
     emb_list = []
     for r in rows:
         v = r.get(field_name)
@@ -152,6 +124,51 @@ def run_dbscan(embeddings: np.ndarray) -> np.ndarray:
     )
     labels = clustering.fit_predict(embeddings)
     return labels.astype(np.int32)
+
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+def crop_face_thumb(img_bgr: np.ndarray, bbox: List[float]) -> bytes:
+    """
+    Recorta cara usando bbox [x1,y1,x2,y2] con padding.
+    Devuelve JPG bytes.
+    """
+    h, w = img_bgr.shape[:2]
+    x1, y1, x2, y2 = [float(x) for x in bbox]
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+
+    pad_x = bw * FACE_PAD_RATIO
+    pad_y = bh * FACE_PAD_RATIO
+
+    xx1 = int(max(0, np.floor(x1 - pad_x)))
+    yy1 = int(max(0, np.floor(y1 - pad_y)))
+    xx2 = int(min(w, np.ceil(x2 + pad_x)))
+    yy2 = int(min(h, np.ceil(y2 + pad_y)))
+
+    if xx2 <= xx1 or yy2 <= yy1:
+        raise RuntimeError("Invalid crop bbox")
+
+    crop = img_bgr[yy1:yy2, xx1:xx2].copy()
+
+    # resize to stable size (max side = FACE_THUMB_SIZE)
+    ch, cw = crop.shape[:2]
+    mx = max(ch, cw)
+    if mx > FACE_THUMB_SIZE:
+        scale = FACE_THUMB_SIZE / float(mx)
+        new_w = max(1, int(round(cw * scale)))
+        new_h = max(1, int(round(ch * scale)))
+        crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    ok, jpg = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    if not ok:
+        raise RuntimeError("Failed to encode face thumbnail")
+    return jpg.tobytes()
 
 
 # -----------------------
@@ -209,7 +226,7 @@ class FindMeWorker:
 
         p_int = normalize_progress_to_int(progress)
         if p_int is not None:
-            payload["progress"] = p_int  # INTEGER 0..100
+            payload["progress"] = p_int
 
         if error_message is not None:
             payload["error_message"] = error_message[:1500]
@@ -229,14 +246,43 @@ class FindMeWorker:
         return resp.data or []
 
     def clear_job_embeddings(self, job_id: str) -> None:
-        # Limpiamos embeddings previos del job (idempotencia)
+        # legacy table (dejamos limpio igual)
         self.sb.table("photo_embeddings").delete().eq("job_id", job_id).execute()
 
-    def upsert_face_embedding(self, photo_id: str, album_id: str, embedding: List[float], bbox: List[float]) -> None:
-        # En tu tabla face_embeddings NO hay id, así que hacemos delete+insert por foto+album para evitar duplicados
-        self.sb.table("face_embeddings").delete().eq("photo_id", photo_id).eq("album_id", album_id).execute()
+    def clear_album_face_embeddings(self, album_id: str) -> None:
+        self.sb.table("face_embeddings").delete().eq("album_id", album_id).execute()
+
+    def clear_album_clusters(self, album_id: str) -> None:
+        self.sb.table("face_clusters").delete().eq("album_id", album_id).execute()
+
+    def clear_photo_faces_for_album(self, album_id: str) -> None:
+        photos = self.fetch_photos(album_id)
+        for p in photos:
+            self.sb.table("photo_faces").delete().eq("photo_id", p["id"]).execute()
+
+    def create_cluster(self, album_id: str, thumbnail_url: Optional[str]) -> str:
+        resp = self.sb.table("face_clusters").insert(
+            {"album_id": album_id, "thumbnail_url": thumbnail_url}
+        ).execute()
+        data = resp.data or []
+        if not data:
+            raise RuntimeError("Could not create face_cluster")
+        return data[0]["id"]
+
+    def upsert_photo_face(self, photo_id: str, cluster_id: str) -> None:
+        """
+        Multifaces: una foto puede estar en múltiples clusters.
+        Usamos upsert por PK compuesta (photo_id, cluster_id).
+        """
+        self.sb.table("photo_faces").upsert(
+            {"photo_id": photo_id, "cluster_id": cluster_id},
+            on_conflict="photo_id,cluster_id",
+        ).execute()
+
+    def insert_face_embedding_row(self, face_id: str, photo_id: str, album_id: str, embedding: List[float], bbox: List[float]) -> None:
         self.sb.table("face_embeddings").insert(
             {
+                "id": face_id,
                 "photo_id": photo_id,
                 "album_id": album_id,
                 "embedding": embedding,
@@ -244,71 +290,31 @@ class FindMeWorker:
             }
         ).execute()
 
-    def insert_photo_embedding(self, photo_id: str, job_id: str, embedding: List[float]) -> None:
-        self.sb.table("photo_embeddings").insert(
-            {
-                "photo_id": photo_id,
-                "job_id": job_id,
-                "embedding": embedding,
-            }
-        ).execute()
-
-    def clear_photo_faces_for_album(self, album_id: str) -> None:
-        # photo_faces solo tiene photo_id, cluster_id, created_at
-        # Borramos mappings para las fotos del album (simple y seguro)
-        photos = self.fetch_photos(album_id)
-        for p in photos:
-            self.sb.table("photo_faces").delete().eq("photo_id", p["id"]).execute()
-
-    def create_cluster(self, album_id: str, thumbnail_url: Optional[str]) -> str:
-        resp = self.sb.table("face_clusters").insert(
-            {
-                "album_id": album_id,
-                "thumbnail_url": thumbnail_url,
-            }
-        ).execute()
-        data = resp.data or []
-        if not data:
-            raise RuntimeError("Could not create face_cluster")
-        return data[0]["id"]
-
-    def insert_photo_face(self, photo_id: str, cluster_id: str) -> None:
-        # idempotencia: borramos y reinsertamos
-        self.sb.table("photo_faces").delete().eq("photo_id", photo_id).execute()
-        self.sb.table("photo_faces").insert(
-            {
-                "photo_id": photo_id,
-                "cluster_id": cluster_id,
-            }
-        ).execute()
+    def upload_bytes(self, storage_path: str, raw: bytes, content_type: str) -> None:
+        up_res = self.sb.storage.from_(SUPABASE_PUBLIC_BUCKET).upload(
+            path=storage_path,
+            file=raw,
+            file_options={"content-type": content_type},
+        )
+        if getattr(up_res, "error", None):
+            raise RuntimeError(f"Storage upload failed for {storage_path}: {up_res.error}")
 
     # -----------------------
     # ZIP ingest (cuando API todavía no crea photos)
     # -----------------------
     def download_zip_bytes(self, zip_path: str) -> bytes:
-        """
-        Descarga el ZIP desde bucket público uploads. zip_path ejemplo: zips/xxxx.zip
-        """
         url = to_public_storage_url(zip_path)
         r = requests.get(url, timeout=HTTP_TIMEOUT_SECONDS)
         r.raise_for_status()
         return r.content
 
     def ingest_zip_to_photos(self, album_id: str, zip_path: str) -> int:
-        """
-        - Descomprime el ZIP en memoria
-        - Sube cada imagen al bucket uploads en: albums/<album_id>/photos/<photo_id>.<ext>
-        - Inserta filas en tabla photos: (id, album_id, storage_path)
-        Retorna cantidad de fotos insertadas.
-        """
         zip_bytes = self.download_zip_bytes(zip_path)
         zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
 
         inserted = 0
         for name in zf.namelist():
             n = name.lower()
-
-            # saltar directorios y archivos no imagen
             if n.endswith("/") or not (n.endswith(".jpg") or n.endswith(".jpeg") or n.endswith(".png")):
                 continue
 
@@ -329,29 +335,16 @@ class FindMeWorker:
             photo_id = str(uuid4())
             storage_path = f"albums/{album_id}/photos/{photo_id}.{ext}"
 
-            # 1) subir al bucket uploads
-            up_res = self.sb.storage.from_(SUPABASE_PUBLIC_BUCKET).upload(
-                path=storage_path,
-                file=raw,
-                file_options={"content-type": content_type},
-            )
-            if getattr(up_res, "error", None):
-                raise RuntimeError(f"Storage upload failed for {storage_path}: {up_res.error}")
+            self.upload_bytes(storage_path=storage_path, raw=raw, content_type=content_type)
 
-            # 2) insertar en photos
             ins = self.sb.table("photos").insert(
-                {
-                    "id": photo_id,
-                    "album_id": album_id,
-                    "storage_path": storage_path,
-                }
+                {"id": photo_id, "album_id": album_id, "storage_path": storage_path}
             ).execute()
             if getattr(ins, "error", None):
                 raise RuntimeError(f"DB insert into photos failed: {ins.error}")
 
             inserted += 1
 
-        # actualizar photo_count en albums
         self.sb.table("albums").update({"photo_count": inserted}).eq("id", album_id).execute()
         return inserted
 
@@ -370,14 +363,14 @@ class FindMeWorker:
 
         album_id = str(album_id)
 
-        # Marcar estados
+        # Estados
         self.mark_job(job_id, "processing")
         self.update_album(album_id, status="processing", progress=1, error_message=None, completed=False)
 
         try:
             photos = self.fetch_photos(album_id)
 
-            # ✅ FIX: si API no creó photos, el worker las crea desde el ZIP
+            # Si API no creó photos, ingerimos ZIP
             if not photos:
                 zip_path = job.get("zip_path")
                 if not zip_path:
@@ -392,124 +385,143 @@ class FindMeWorker:
                 photos = self.fetch_photos(album_id)
                 if not photos:
                     raise RuntimeError("ZIP ingest ran but photos table is still empty for this album")
-                # progress después del ingest
+
                 self.update_album(album_id, status="processing", progress=5)
 
-            total = len(photos)
-            logger.info("Album %s photos=%s", album_id, total)
+            total_photos = len(photos)
+            logger.info("Album %s photos=%s", album_id, total_photos)
 
-            # 1) Generar embeddings por foto (principal)
+            # Idempotencia: limpiar output previo del álbum
             self.clear_job_embeddings(job_id)
+            self.clear_photo_faces_for_album(album_id)
+            self.clear_album_clusters(album_id)
+            self.clear_album_face_embeddings(album_id)
 
-            processed = 0
-            no_face = 0
+            # 1) Detectar TODAS las caras + guardar embeddings por cara
+            faces_rows: List[Dict[str, Any]] = []
+            face_thumb_url_by_face_id: Dict[str, str] = {}
 
-            for p in photos:
+            photos_with_faces = 0
+            photos_no_face = 0
+            faces_total = 0
+
+            for idx, p in enumerate(photos):
                 photo_id = str(p["id"])
                 storage_path = str(p["storage_path"])
                 url = to_public_storage_url(storage_path)
 
                 try:
                     img = download_image(url)
-                    faces = self.face_app.get(img)
-                    primary = pick_primary_face(faces)
-                    if primary is None or getattr(primary, "embedding", None) is None:
-                        no_face += 1
+                    faces = self.face_app.get(img) or []
+
+                    # filtrar caras sin embedding
+                    faces = [f for f in faces if getattr(f, "embedding", None) is not None and getattr(f, "bbox", None) is not None]
+
+                    if not faces:
+                        photos_no_face += 1
                         continue
 
-                    emb = primary.embedding.astype(np.float32).tolist()
-                    bbox = [float(x) for x in primary.bbox.tolist()]
+                    photos_with_faces += 1
 
-                    # Guardar en tablas existentes
-                    self.upsert_face_embedding(photo_id=photo_id, album_id=album_id, embedding=emb, bbox=bbox)
-                    self.insert_photo_embedding(photo_id=photo_id, job_id=job_id, embedding=emb)
+                    for f in faces:
+                        face_id = str(uuid4())
+                        emb = f.embedding.astype(np.float32).tolist()
+                        bbox = [float(x) for x in f.bbox.tolist()]
 
-                    processed += 1
+                        # thumbnail de cara (recorte)
+                        thumb_bytes = crop_face_thumb(img, bbox)
+                        thumb_path = f"albums/{album_id}/faces/{face_id}.jpg"
+                        self.upload_bytes(storage_path=thumb_path, raw=thumb_bytes, content_type="image/jpeg")
+                        thumb_url = to_public_storage_url(thumb_path)
+                        face_thumb_url_by_face_id[face_id] = thumb_url
+
+                        # persist en DB: 1 row por cara
+                        self.insert_face_embedding_row(
+                            face_id=face_id,
+                            photo_id=photo_id,
+                            album_id=album_id,
+                            embedding=emb,
+                            bbox=bbox,
+                        )
+
+                        faces_rows.append(
+                            {
+                                "face_id": face_id,
+                                "photo_id": photo_id,
+                                "embedding": emb,
+                            }
+                        )
+                        faces_total += 1
 
                 except Exception as e:
                     logger.warning("Photo failed id=%s path=%s err=%s", photo_id, storage_path, str(e))
 
-                # progreso incremental: 1..60 durante embeddings
-                prog_ratio = processed / max(1, total)
-                prog_int = clamp_int(int(round(5 + prog_ratio * 55)), 1, 60)
+                # progreso 5..60 por fotos procesadas (detección)
+                prog_ratio = (idx + 1) / max(1, total_photos)
+                prog_int = clamp_int(int(round(5 + prog_ratio * 55)), 5, 60)
                 self.update_album(album_id, status="processing", progress=prog_int)
 
-            if processed == 0:
-                raise RuntimeError(f"No embeddings generated. Photos={total}, no_face={no_face}")
+            if faces_total == 0:
+                raise RuntimeError(f"No faces detected/embedded. photos={total_photos}, photos_no_face={photos_no_face}")
 
-            # 2) Clustering por job
-            pe = (
-                self.sb.table("photo_embeddings")
-                .select("photo_id, embedding")
-                .eq("job_id", job_id)
-                .execute()
-            ).data or []
-
-            if not pe:
-                raise RuntimeError("photo_embeddings empty after processing photos")
-
-            embeddings = parse_embeddings(pe, field_name="embedding")
+            # 2) Clustering por CARA (no por foto)
+            embeddings = np.array([r["embedding"] for r in faces_rows], dtype=np.float32)
             labels = run_dbscan(embeddings)
 
-            # En clustering, marcamos progreso 70 antes de escribir clusters
             self.update_album(album_id, status="processing", progress=70)
 
             # 3) Crear clusters + asignar photo_faces
-            # Limpiamos mappings previos
-            self.clear_photo_faces_for_album(album_id)
-
-            # Mapa label -> cluster_id
+            # label -> cluster_id
             cluster_map: Dict[int, str] = {}
 
-            # Para thumbnail: usar la primera foto de ese cluster
-            # Armamos acceso rápido photo_id -> storage url
-            photo_url_map: Dict[str, str] = {}
-            for p in photos:
-                photo_url_map[str(p["id"])] = to_public_storage_url(str(p["storage_path"]))
-
-            # Primero labels != -1
             unique_labels = sorted({int(x) for x in labels.tolist() if int(x) != -1})
+
+            # Crear clusters para labels válidos
             for lab in unique_labels:
-                thumb = None
-                for row, l in zip(pe, labels):
+                rep_face_id = None
+                for r, l in zip(faces_rows, labels):
                     if int(l) == lab:
-                        thumb = photo_url_map.get(str(row["photo_id"]))
+                        rep_face_id = r["face_id"]
                         break
-                cluster_id = self.create_cluster(album_id=album_id, thumbnail_url=thumb)
+                thumb_url = face_thumb_url_by_face_id.get(rep_face_id) if rep_face_id else None
+                cluster_id = self.create_cluster(album_id=album_id, thumbnail_url=thumb_url)
                 cluster_map[lab] = cluster_id
 
-            # Ahora asignación por foto
-            assigned = 0
-            noise = 0
-            for row, lab in zip(pe, labels):
-                photo_id = str(row["photo_id"])
+            # Asignación many-to-many por cara -> cluster; luego mapear a photo_faces
+            assigned_faces = 0
+            noise_faces = 0
+
+            for i, (r, lab) in enumerate(zip(faces_rows, labels)):
+                photo_id = str(r["photo_id"])
                 lab_int = int(lab)
 
                 if lab_int == -1:
-                    noise += 1
-                    thumb = photo_url_map.get(photo_id)
-                    cluster_id = self.create_cluster(album_id=album_id, thumbnail_url=thumb)
-                    self.insert_photo_face(photo_id=photo_id, cluster_id=cluster_id)
+                    # ruido: cluster individual por cara
+                    noise_faces += 1
+                    thumb_url = face_thumb_url_by_face_id.get(str(r["face_id"]))
+                    cluster_id = self.create_cluster(album_id=album_id, thumbnail_url=thumb_url)
+                    self.upsert_photo_face(photo_id=photo_id, cluster_id=cluster_id)
                 else:
                     cluster_id = cluster_map[lab_int]
-                    self.insert_photo_face(photo_id=photo_id, cluster_id=cluster_id)
+                    self.upsert_photo_face(photo_id=photo_id, cluster_id=cluster_id)
 
-                assigned += 1
+                assigned_faces += 1
 
-                # progreso 70..95 mientras asignamos
-                prog_ratio = assigned / max(1, len(pe))
+                # progreso 70..95 por asignación
+                prog_ratio = (i + 1) / max(1, len(faces_rows))
                 prog_int = clamp_int(int(round(70 + prog_ratio * 25)), 70, 95)
                 self.update_album(album_id, status="processing", progress=prog_int)
 
-            # 4) Finalizar
+            # 4) Final
             result = {
                 "album_id": album_id,
-                "photos_total": total,
-                "photos_embedded": processed,
-                "photos_no_face": no_face,
-                "assigned": assigned,
-                "noise": noise,
-                "clusters": len(unique_labels) + noise,
+                "photos_total": total_photos,
+                "photos_with_faces": photos_with_faces,
+                "photos_no_face": photos_no_face,
+                "faces_total": faces_total,
+                "faces_assigned": assigned_faces,
+                "faces_noise": noise_faces,
+                "clusters": len(unique_labels) + noise_faces,  # noise crea cluster propio
                 "dbscan": {"eps": DBSCAN_EPS, "min_samples": DBSCAN_MIN_SAMPLES},
             }
 
