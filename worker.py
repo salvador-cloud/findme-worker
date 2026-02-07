@@ -5,8 +5,8 @@ import logging
 import io
 import zipfile
 from uuid import uuid4
-from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any, Tuple
+from datetime import datetime, timezone, timedelta
+from typing import List, Optional, Dict, Any
 
 import numpy as np
 import requests
@@ -51,6 +51,11 @@ FACE_PAD_RATIO = float(os.environ.get("FACE_PAD_RATIO", "0.30"))  # bbox padding
 MERGE_CENTROID_COS = float(os.environ.get("MERGE_CENTROID_COS", "0.60"))
 MERGE_BESTPAIR_COS = float(os.environ.get("MERGE_BESTPAIR_COS", "0.70"))
 MAX_FACES_PER_CLUSTER_FOR_PAIRWISE = int(os.environ.get("MAX_FACES_PER_CLUSTER_FOR_PAIRWISE", "40"))
+
+# P0 guards
+MAX_PHOTOS_PER_ALBUM = int(os.environ.get("MAX_PHOTOS_PER_ALBUM", "500"))
+ALBUM_RETENTION_DAYS = int(os.environ.get("ALBUM_RETENTION_DAYS", "7"))
+CLEANUP_EVERY_SECONDS = int(os.environ.get("CLEANUP_EVERY_SECONDS", "3600"))  # 1h
 
 
 # -----------------------
@@ -104,21 +109,6 @@ def download_image(url: str) -> np.ndarray:
     return img
 
 
-def parse_embeddings(rows: List[dict], field_name: str = "embedding") -> np.ndarray:
-    emb_list = []
-    for r in rows:
-        v = r.get(field_name)
-        if v is None:
-            continue
-        if isinstance(v, list):
-            emb_list.append(v)
-        elif isinstance(v, str):
-            emb_list.append(json.loads(v))
-        else:
-            emb_list.append(list(v))
-    return np.array(emb_list, dtype=np.float32)
-
-
 def run_dbscan(embeddings: np.ndarray) -> np.ndarray:
     if embeddings.size == 0:
         return np.array([], dtype=np.int32)
@@ -129,13 +119,6 @@ def run_dbscan(embeddings: np.ndarray) -> np.ndarray:
     )
     labels = clustering.fit_predict(embeddings)
     return labels.astype(np.int32)
-
-
-def _safe_int(v: Any, default: int = 0) -> int:
-    try:
-        return int(v)
-    except Exception:
-        return default
 
 
 def crop_face_thumb(img_bgr: np.ndarray, bbox: List[float]) -> bytes:
@@ -240,8 +223,7 @@ def merge_clusters(
 ) -> np.ndarray:
     """
     Une clusters DBSCAN si parecen la misma persona.
-    Anti-merge duro: si dos clusters aparecen en la MISMA foto => no pueden ser la misma persona.
-    Esto evita merges falsos (dos personas distintas co-ocurrentes).
+    Anti-merge: si dos clusters aparecen en la MISMA foto => no pueden ser la misma persona.
     """
     clusters = build_clusters_from_labels(faces_rows, labels)
     if len(clusters) <= 1:
@@ -253,7 +235,6 @@ def merge_clusters(
         centroids[lab] = compute_centroid(embs, idxs)
         photosets[lab] = cluster_photo_set(faces_rows, idxs)
 
-    # union-find
     parent = {lab: lab for lab in clusters.keys()}
 
     def find(x: int) -> int:
@@ -272,7 +253,6 @@ def merge_clusters(
         for j in range(i + 1, len(labs)):
             a, b = labs[i], labs[j]
 
-            # Anti-merge: si comparten alguna photo_id, son dos personas distintas en la misma foto
             if len(photosets[a].intersection(photosets[b])) > 0:
                 continue
 
@@ -286,7 +266,6 @@ def merge_clusters(
 
             union(a, b)
 
-    # map root -> new compact label
     root_to_new: Dict[int, int] = {}
     old_to_new: Dict[int, int] = {}
     next_id = 0
@@ -321,14 +300,18 @@ class FindMeWorker:
         self.face_app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
         self.face_app.prepare(ctx_id=0, det_size=(640, 640))
 
+        self._last_cleanup_ts = 0.0
+
         logger.info(
-            "Worker initialized. Poll=%ss | DBSCAN eps=%s min_samples=%s | bucket=%s | merge centroid=%s bestpair=%s",
+            "Worker initialized. Poll=%ss | DBSCAN eps=%s min_samples=%s | bucket=%s | merge centroid=%s bestpair=%s | max_photos=%s | retention_days=%s",
             POLL_SECONDS,
             DBSCAN_EPS,
             DBSCAN_MIN_SAMPLES,
             SUPABASE_PUBLIC_BUCKET,
             MERGE_CENTROID_COS,
             MERGE_BESTPAIR_COS,
+            MAX_PHOTOS_PER_ALBUM,
+            ALBUM_RETENTION_DAYS,
         )
 
     # -----------------------
@@ -410,7 +393,7 @@ class FindMeWorker:
     def upsert_photo_face(self, photo_id: str, cluster_id: str) -> None:
         """
         Multifaces: una foto puede estar en múltiples clusters.
-        Usamos upsert por PK compuesta (photo_id, cluster_id).
+        Upsert por PK compuesta (photo_id, cluster_id).
         """
         self.sb.table("photo_faces").upsert(
             {"photo_id": photo_id, "cluster_id": cluster_id},
@@ -418,7 +401,6 @@ class FindMeWorker:
         ).execute()
 
     def insert_face_embedding_row(self, face_id: str, photo_id: str, album_id: str, embedding: List[float], bbox: List[float]) -> None:
-        # Nota: requiere que face_embeddings tenga columna "id".
         self.sb.table("face_embeddings").insert(
             {
                 "id": face_id,
@@ -438,8 +420,15 @@ class FindMeWorker:
         if getattr(up_res, "error", None):
             raise RuntimeError(f"Storage upload failed for {storage_path}: {up_res.error}")
 
+    def remove_paths(self, paths: List[str]) -> None:
+        paths = [p for p in paths if p]
+        if not paths:
+            return
+        # Supabase storage remove acepta lista de paths
+        self.sb.storage.from_(SUPABASE_PUBLIC_BUCKET).remove(paths)
+
     # -----------------------
-    # ZIP ingest (cuando API todavía no crea photos)
+    # ZIP ingest
     # -----------------------
     def download_zip_bytes(self, zip_path: str) -> bytes:
         url = to_public_storage_url(zip_path)
@@ -460,6 +449,9 @@ class FindMeWorker:
             raw = zf.read(name)
             if not raw:
                 continue
+
+            if inserted >= MAX_PHOTOS_PER_ALBUM:
+                raise RuntimeError(f"Album exceeds max allowed photos ({MAX_PHOTOS_PER_ALBUM})")
 
             if n.endswith(".png"):
                 ext = "png"
@@ -488,6 +480,74 @@ class FindMeWorker:
         return inserted
 
     # -----------------------
+    # Album deletion (for retention)
+    # -----------------------
+    def delete_album_everywhere(self, album_id: str) -> None:
+        """
+        Borrado hard:
+        - Storage: fotos + thumbs
+        - DB: photo_faces, face_embeddings, face_clusters, photos, jobs, albums
+        """
+        album_id = str(album_id)
+        logger.info("Deleting album everywhere album_id=%s", album_id)
+
+        # storage paths for photos
+        photos = (
+            self.sb.table("photos")
+            .select("id,storage_path")
+            .eq("album_id", album_id)
+            .execute()
+        ).data or []
+
+        photo_paths = [p.get("storage_path") for p in photos if p.get("storage_path")]
+        self.remove_paths(photo_paths)
+
+        # face thumbs: derivamos por face_embeddings.id (si existen)
+        faces = (
+            self.sb.table("face_embeddings")
+            .select("id")
+            .eq("album_id", album_id)
+            .execute()
+        ).data or []
+        face_thumb_paths = [f"albums/{album_id}/faces/{r['id']}.jpg" for r in faces if r.get("id")]
+        self.remove_paths(face_thumb_paths)
+
+        # DB cleanup (orden: dependencias primero)
+        photo_ids = [p.get("id") for p in photos if p.get("id")]
+        for pid in photo_ids:
+            self.sb.table("photo_faces").delete().eq("photo_id", pid).execute()
+
+        self.sb.table("face_embeddings").delete().eq("album_id", album_id).execute()
+        self.sb.table("face_clusters").delete().eq("album_id", album_id).execute()
+        self.sb.table("photos").delete().eq("album_id", album_id).execute()
+        self.sb.table("jobs").delete().eq("album_id", album_id).execute()
+        self.sb.table("albums").delete().eq("id", album_id).execute()
+
+    def cleanup_old_albums(self) -> None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=ALBUM_RETENTION_DAYS)
+
+        # Solo borrar álbumes completados o en error, para no matar un processing.
+        resp = (
+            self.sb.table("albums")
+            .select("id,status,created_at")
+            .lt("created_at", cutoff.isoformat())
+            .in_("status", ["completed", "error"])
+            .limit(200)
+            .execute()
+        )
+        rows = resp.data or []
+        if not rows:
+            logger.info("Cleanup: no old albums to delete (cutoff=%s)", cutoff.isoformat())
+            return
+
+        logger.info("Cleanup: deleting %s old albums (cutoff=%s)", len(rows), cutoff.isoformat())
+        for r in rows:
+            try:
+                self.delete_album_everywhere(r["id"])
+            except Exception as e:
+                logger.warning("Cleanup failed album_id=%s err=%s", r.get("id"), str(e))
+
+    # -----------------------
     # Core processing
     # -----------------------
     def process_job(self, job: dict) -> None:
@@ -502,7 +562,6 @@ class FindMeWorker:
 
         album_id = str(album_id)
 
-        # Estados
         self.mark_job(job_id, "processing")
         self.update_album(album_id, status="processing", progress=1, error_message=None, completed=False)
 
@@ -528,6 +587,9 @@ class FindMeWorker:
                 self.update_album(album_id, status="processing", progress=5)
 
             total_photos = len(photos)
+            if total_photos > MAX_PHOTOS_PER_ALBUM:
+                raise RuntimeError(f"Album exceeds max allowed photos ({MAX_PHOTOS_PER_ALBUM})")
+
             logger.info("Album %s photos=%s", album_id, total_photos)
 
             # Idempotencia: limpiar output previo del álbum
@@ -536,7 +598,6 @@ class FindMeWorker:
             self.clear_album_clusters(album_id)
             self.clear_album_face_embeddings(album_id)
 
-            # 1) Detectar TODAS las caras + guardar embeddings por cara
             faces_rows: List[Dict[str, Any]] = []
             face_thumb_url_by_face_id: Dict[str, str] = {}
 
@@ -553,7 +614,6 @@ class FindMeWorker:
                     img = download_image(url)
                     faces = self.face_app.get(img) or []
 
-                    # filtrar caras sin embedding
                     faces = [
                         f for f in faces
                         if getattr(f, "embedding", None) is not None and getattr(f, "bbox", None) is not None
@@ -570,14 +630,12 @@ class FindMeWorker:
                         emb = f.embedding.astype(np.float32).tolist()
                         bbox = [float(x) for x in f.bbox.tolist()]
 
-                        # thumbnail de cara (recorte)
                         thumb_bytes = crop_face_thumb(img, bbox)
                         thumb_path = f"albums/{album_id}/faces/{face_id}.jpg"
                         self.upload_bytes(storage_path=thumb_path, raw=thumb_bytes, content_type="image/jpeg")
                         thumb_url = to_public_storage_url(thumb_path)
                         face_thumb_url_by_face_id[face_id] = thumb_url
 
-                        # persist en DB: 1 row por cara
                         self.insert_face_embedding_row(
                             face_id=face_id,
                             photo_id=photo_id,
@@ -587,18 +645,13 @@ class FindMeWorker:
                         )
 
                         faces_rows.append(
-                            {
-                                "face_id": face_id,
-                                "photo_id": photo_id,
-                                "embedding": emb,
-                            }
+                            {"face_id": face_id, "photo_id": photo_id, "embedding": emb}
                         )
                         faces_total += 1
 
                 except Exception as e:
                     logger.warning("Photo failed id=%s path=%s err=%s", photo_id, storage_path, str(e))
 
-                # progreso 5..60 por fotos procesadas (detección)
                 prog_ratio = (idx + 1) / max(1, total_photos)
                 prog_int = clamp_int(int(round(5 + prog_ratio * 55)), 5, 60)
                 self.update_album(album_id, status="processing", progress=prog_int)
@@ -606,21 +659,19 @@ class FindMeWorker:
             if faces_total == 0:
                 raise RuntimeError(f"No faces detected/embedded. photos={total_photos}, photos_no_face={photos_no_face}")
 
-            # 2) Clustering por CARA (no por foto)
+            # 2) Clustering por CARA
             embeddings = np.array([r["embedding"] for r in faces_rows], dtype=np.float32)
             labels = run_dbscan(embeddings)
 
-            # 2b) Merge inteligente post-DBSCAN (reduce split frontal vs perfil)
+            # 2b) Merge inteligente post-DBSCAN
             labels = merge_clusters(faces_rows, embeddings, labels)
 
             self.update_album(album_id, status="processing", progress=70)
 
             # 3) Crear clusters + asignar photo_faces
             cluster_map: Dict[int, str] = {}
-
             unique_labels = sorted({int(x) for x in labels.tolist() if int(x) != -1})
 
-            # Crear clusters para labels válidos
             for lab in unique_labels:
                 rep_face_id = None
                 for r, l in zip(faces_rows, labels):
@@ -639,7 +690,6 @@ class FindMeWorker:
                 lab_int = int(lab)
 
                 if lab_int == -1:
-                    # ruido: cluster individual por cara
                     noise_faces += 1
                     thumb_url = face_thumb_url_by_face_id.get(str(r["face_id"]))
                     cluster_id = self.create_cluster(album_id=album_id, thumbnail_url=thumb_url)
@@ -650,12 +700,10 @@ class FindMeWorker:
 
                 assigned_faces += 1
 
-                # progreso 70..95 por asignación
                 prog_ratio = (i + 1) / max(1, len(faces_rows))
                 prog_int = clamp_int(int(round(70 + prog_ratio * 25)), 70, 95)
                 self.update_album(album_id, status="processing", progress=prog_int)
 
-            # 4) Final
             result = {
                 "album_id": album_id,
                 "photos_total": total_photos,
@@ -664,12 +712,16 @@ class FindMeWorker:
                 "faces_total": faces_total,
                 "faces_assigned": assigned_faces,
                 "faces_noise": noise_faces,
-                "clusters": len(unique_labels) + noise_faces,  # noise crea cluster propio
+                "clusters": len(unique_labels) + noise_faces,
                 "dbscan": {"eps": DBSCAN_EPS, "min_samples": DBSCAN_MIN_SAMPLES},
                 "merge": {
                     "centroid_cos": MERGE_CENTROID_COS,
                     "bestpair_cos": MERGE_BESTPAIR_COS,
                     "max_pairwise": MAX_FACES_PER_CLUSTER_FOR_PAIRWISE,
+                },
+                "limits": {
+                    "max_photos_per_album": MAX_PHOTOS_PER_ALBUM,
+                    "retention_days": ALBUM_RETENTION_DAYS,
                 },
             }
 
@@ -685,11 +737,21 @@ class FindMeWorker:
     def run_forever(self) -> None:
         while True:
             try:
+                # scheduled cleanup
+                now_ts = time.time()
+                if now_ts - self._last_cleanup_ts >= CLEANUP_EVERY_SECONDS:
+                    self._last_cleanup_ts = now_ts
+                    try:
+                        self.cleanup_old_albums()
+                    except Exception:
+                        logger.exception("Cleanup loop error (will continue)")
+
                 jobs = self.fetch_pending_jobs()
                 if jobs:
                     logger.info("Pending jobs: %s", len(jobs))
                 for j in jobs:
                     self.process_job(j)
+
             except Exception:
                 logger.exception("Loop error (will continue)")
 
