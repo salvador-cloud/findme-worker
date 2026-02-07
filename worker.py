@@ -2,6 +2,9 @@ import os
 import time
 import json
 import logging
+import io
+import zipfile
+from uuid import uuid4
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 
@@ -280,6 +283,79 @@ class FindMeWorker:
         ).execute()
 
     # -----------------------
+    # ZIP ingest (cuando API todavía no crea photos)
+    # -----------------------
+    def download_zip_bytes(self, zip_path: str) -> bytes:
+        """
+        Descarga el ZIP desde bucket público uploads. zip_path ejemplo: zips/xxxx.zip
+        """
+        url = to_public_storage_url(zip_path)
+        r = requests.get(url, timeout=HTTP_TIMEOUT_SECONDS)
+        r.raise_for_status()
+        return r.content
+
+    def ingest_zip_to_photos(self, album_id: str, zip_path: str) -> int:
+        """
+        - Descomprime el ZIP en memoria
+        - Sube cada imagen al bucket uploads en: albums/<album_id>/photos/<photo_id>.<ext>
+        - Inserta filas en tabla photos: (id, album_id, storage_path)
+        Retorna cantidad de fotos insertadas.
+        """
+        zip_bytes = self.download_zip_bytes(zip_path)
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+
+        inserted = 0
+        for name in zf.namelist():
+            n = name.lower()
+
+            # saltar directorios y archivos no imagen
+            if n.endswith("/") or not (n.endswith(".jpg") or n.endswith(".jpeg") or n.endswith(".png")):
+                continue
+
+            raw = zf.read(name)
+            if not raw:
+                continue
+
+            if n.endswith(".png"):
+                ext = "png"
+                content_type = "image/png"
+            elif n.endswith(".jpeg"):
+                ext = "jpeg"
+                content_type = "image/jpeg"
+            else:
+                ext = "jpg"
+                content_type = "image/jpeg"
+
+            photo_id = str(uuid4())
+            storage_path = f"albums/{album_id}/photos/{photo_id}.{ext}"
+
+            # 1) subir al bucket uploads
+            up_res = self.sb.storage.from_(SUPABASE_PUBLIC_BUCKET).upload(
+                path=storage_path,
+                file=raw,
+                file_options={"content-type": content_type},
+            )
+            if getattr(up_res, "error", None):
+                raise RuntimeError(f"Storage upload failed for {storage_path}: {up_res.error}")
+
+            # 2) insertar en photos
+            ins = self.sb.table("photos").insert(
+                {
+                    "id": photo_id,
+                    "album_id": album_id,
+                    "storage_path": storage_path,
+                }
+            ).execute()
+            if getattr(ins, "error", None):
+                raise RuntimeError(f"DB insert into photos failed: {ins.error}")
+
+            inserted += 1
+
+        # actualizar photo_count en albums
+        self.sb.table("albums").update({"photo_count": inserted}).eq("id", album_id).execute()
+        return inserted
+
+    # -----------------------
     # Core processing
     # -----------------------
     def process_job(self, job: dict) -> None:
@@ -300,8 +376,24 @@ class FindMeWorker:
 
         try:
             photos = self.fetch_photos(album_id)
+
+            # ✅ FIX: si API no creó photos, el worker las crea desde el ZIP
             if not photos:
-                raise RuntimeError("No photos found for album_id. Ensure API created photos rows and storage_path.")
+                zip_path = job.get("zip_path")
+                if not zip_path:
+                    raise RuntimeError("No photos found and missing jobs.zip_path to ingest")
+
+                logger.info("No photos rows for album %s. Ingesting ZIP zip_path=%s", album_id, zip_path)
+                self.update_album(album_id, status="processing", progress=2)
+
+                added = self.ingest_zip_to_photos(album_id=album_id, zip_path=str(zip_path))
+                logger.info("ZIP ingest done. photos_added=%s album_id=%s", added, album_id)
+
+                photos = self.fetch_photos(album_id)
+                if not photos:
+                    raise RuntimeError("ZIP ingest ran but photos table is still empty for this album")
+                # progress después del ingest
+                self.update_album(album_id, status="processing", progress=5)
 
             total = len(photos)
             logger.info("Album %s photos=%s", album_id, total)
@@ -338,7 +430,6 @@ class FindMeWorker:
                     logger.warning("Photo failed id=%s path=%s err=%s", photo_id, storage_path, str(e))
 
                 # progreso incremental: 1..60 durante embeddings
-                # sube de 5 a 60 aprox según avance
                 prog_ratio = processed / max(1, total)
                 prog_int = clamp_int(int(round(5 + prog_ratio * 55)), 1, 60)
                 self.update_album(album_id, status="processing", progress=prog_int)
@@ -379,7 +470,6 @@ class FindMeWorker:
             # Primero labels != -1
             unique_labels = sorted({int(x) for x in labels.tolist() if int(x) != -1})
             for lab in unique_labels:
-                # buscar thumbnail candidate
                 thumb = None
                 for row, l in zip(pe, labels):
                     if int(l) == lab:
@@ -396,7 +486,6 @@ class FindMeWorker:
                 lab_int = int(lab)
 
                 if lab_int == -1:
-                    # ruido: cluster único por foto (MVP usable)
                     noise += 1
                     thumb = photo_url_map.get(photo_id)
                     cluster_id = self.create_cluster(album_id=album_id, thumbnail_url=thumb)
@@ -430,7 +519,6 @@ class FindMeWorker:
 
         except Exception as e:
             logger.exception("Job failed %s", job_id)
-            # dejar album en error
             self.update_album(album_id, status="error", progress=0, error_message=str(e), completed=False)
             self.mark_job(job_id, "error", error=str(e))
 
