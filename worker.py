@@ -42,10 +42,16 @@ SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 RQ_QUEUE_NAME = os.environ.get("RQ_QUEUE_NAME", "findme").strip()
 
+# Burst-loop knobs (Upstash friendly)
+RQ_BURST_SLEEP_SECONDS = int(os.environ.get("RQ_BURST_SLEEP_SECONDS", "2"))
+REDIS_SOCKET_TIMEOUT = int(os.environ.get("REDIS_SOCKET_TIMEOUT", "10"))
+REDIS_SOCKET_CONNECT_TIMEOUT = int(os.environ.get("REDIS_SOCKET_CONNECT_TIMEOUT", "10"))
+REDIS_HEALTH_CHECK_INTERVAL = int(os.environ.get("REDIS_HEALTH_CHECK_INTERVAL", "15"))
+
 # RQ reliability knobs
-RQ_JOB_TIMEOUT_SECONDS = int(os.environ.get("RQ_JOB_TIMEOUT_SECONDS", "1800"))  # 30m
-RQ_RESULT_TTL_SECONDS = int(os.environ.get("RQ_RESULT_TTL_SECONDS", "3600"))   # 1h
-RQ_FAILURE_TTL_SECONDS = int(os.environ.get("RQ_FAILURE_TTL_SECONDS", "86400")) # 1d
+RQ_JOB_TIMEOUT_SECONDS = int(os.environ.get("RQ_JOB_TIMEOUT_SECONDS", "1800"))   # 30m
+RQ_RESULT_TTL_SECONDS = int(os.environ.get("RQ_RESULT_TTL_SECONDS", "3600"))     # 1h
+RQ_FAILURE_TTL_SECONDS = int(os.environ.get("RQ_FAILURE_TTL_SECONDS", "86400"))  # 1d
 
 # DBSCAN tuning
 DBSCAN_EPS = float(os.environ.get("DBSCAN_EPS", "0.35"))
@@ -870,30 +876,53 @@ def main() -> None:
     redis_conn = redis.Redis.from_url(
         REDIS_URL,
         decode_responses=True,
-        socket_timeout=10,
-        socket_connect_timeout=10,
-        health_check_interval=30,
+        socket_timeout=REDIS_SOCKET_TIMEOUT,
+        socket_connect_timeout=REDIS_SOCKET_CONNECT_TIMEOUT,
+        retry_on_timeout=True,
+        health_check_interval=REDIS_HEALTH_CHECK_INTERVAL,
     )
 
-    with Connection(redis_conn):
-        q = Queue(
-            RQ_QUEUE_NAME,
-            default_timeout=RQ_JOB_TIMEOUT_SECONDS,
-        )
+    logger.info(
+        "RQ worker boot (burst-loop). queue=%s redis=%s sleep=%ss timeouts=(%s/%s)",
+        RQ_QUEUE_NAME,
+        "configured",
+        RQ_BURST_SLEEP_SECONDS,
+        REDIS_SOCKET_CONNECT_TIMEOUT,
+        REDIS_SOCKET_TIMEOUT,
+    )
 
-        logger.info("RQ worker boot. queue=%s redis=%s", RQ_QUEUE_NAME, "configured")
+    # Upstash/serverless-friendly pattern:
+    # - connect
+    # - process what's available (burst=True)
+    # - exit work loop
+    # - sleep
+    # - repeat
+    while True:
+        try:
+            with Connection(redis_conn):
+                q = Queue(
+                    RQ_QUEUE_NAME,
+                    default_timeout=RQ_JOB_TIMEOUT_SECONDS,
+                )
 
-        w = Worker(
-            [q],
-            connection=redis_conn,
-            default_worker_ttl=420,
-            job_monitoring_interval=30,
-            log_job_description=False,
-        )
-        w.work(
-            with_scheduler=False,
-            logging_level=logging.INFO,
-        )
+                w = Worker(
+                    [q],
+                    connection=redis_conn,
+                    default_worker_ttl=420,
+                    job_monitoring_interval=30,
+                    log_job_description=False,
+                )
+
+                # burst=True => no long-lived listen connection (prevents Upstash idle-kill)
+                w.work(
+                    burst=True,
+                    with_scheduler=False,
+                    logging_level=logging.INFO,
+                )
+        except Exception as e:
+            logger.exception("RQ burst loop error (will continue): %s", str(e))
+
+        time.sleep(RQ_BURST_SLEEP_SECONDS)
 
 
 if __name__ == "__main__":
