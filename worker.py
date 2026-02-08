@@ -4,9 +4,10 @@ import json
 import logging
 import io
 import zipfile
+import random
 from uuid import uuid4
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Callable, TypeVar
 
 import numpy as np
 import requests
@@ -46,6 +47,7 @@ HTTP_TIMEOUT_SECONDS = int(os.environ.get("HTTP_TIMEOUT_SECONDS", "30"))
 # Face thumbnails tuning
 FACE_THUMB_SIZE = int(os.environ.get("FACE_THUMB_SIZE", "320"))  # max side length
 FACE_PAD_RATIO = float(os.environ.get("FACE_PAD_RATIO", "0.30"))  # bbox padding
+THUMB_JPEG_QUALITY = int(os.environ.get("THUMB_JPEG_QUALITY", "85"))  # cost control
 
 # Merge tuning (post DBSCAN)
 MERGE_CENTROID_COS = float(os.environ.get("MERGE_CENTROID_COS", "0.60"))
@@ -56,6 +58,13 @@ MAX_FACES_PER_CLUSTER_FOR_PAIRWISE = int(os.environ.get("MAX_FACES_PER_CLUSTER_F
 MAX_PHOTOS_PER_ALBUM = int(os.environ.get("MAX_PHOTOS_PER_ALBUM", "500"))
 ALBUM_RETENTION_DAYS = int(os.environ.get("ALBUM_RETENTION_DAYS", "7"))
 CLEANUP_EVERY_SECONDS = int(os.environ.get("CLEANUP_EVERY_SECONDS", "3600"))  # 1h
+
+# P2-ish reliability / scale (still DB-poll based, but safe for multiple workers)
+JOB_STALE_MINUTES = int(os.environ.get("JOB_STALE_MINUTES", "30"))  # requeue if processing too long
+CLAIM_BATCH = int(os.environ.get("CLAIM_BATCH", "5"))  # how many pending jobs to consider per poll
+
+# Cost controls
+DELETE_ZIP_AFTER_INGEST = os.environ.get("DELETE_ZIP_AFTER_INGEST", "0").strip() in ("1", "true", "True", "yes", "YES")
 
 
 # -----------------------
@@ -99,8 +108,33 @@ def to_public_storage_url(storage_path: str) -> str:
     return f"{base}/storage/v1/object/public/{SUPABASE_PUBLIC_BUCKET}/{path}"
 
 
-def download_image(url: str) -> np.ndarray:
-    r = requests.get(url, timeout=HTTP_TIMEOUT_SECONDS)
+# --- retry wrapper for flaky network / occasional Supabase disconnects ---
+T = TypeVar("T")
+
+
+def with_retry(fn: Callable[[], T], *, tries: int = 4, base_sleep: float = 0.35) -> T:
+    last_exc: Optional[Exception] = None
+    for attempt in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            last_exc = e
+            # exponential backoff + jitter
+            sleep_s = base_sleep * (2 ** attempt) + random.uniform(0.0, 0.2)
+            logger.warning("Retryable error (attempt %s/%s): %s", attempt + 1, tries, str(e))
+            time.sleep(sleep_s)
+    assert last_exc is not None
+    raise last_exc
+
+
+# --- requests session with basic retry (for storage fetches) ---
+def _requests_session() -> requests.Session:
+    s = requests.Session()
+    return s
+
+
+def download_image(session: requests.Session, url: str) -> np.ndarray:
+    r = session.get(url, timeout=HTTP_TIMEOUT_SECONDS)
     r.raise_for_status()
     data = np.frombuffer(r.content, dtype=np.uint8)
     img = cv2.imdecode(data, cv2.IMREAD_COLOR)
@@ -153,7 +187,7 @@ def crop_face_thumb(img_bgr: np.ndarray, bbox: List[float]) -> bytes:
         new_h = max(1, int(round(ch * scale)))
         crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    ok, jpg = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+    ok, jpg = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), THUMB_JPEG_QUALITY])
     if not ok:
         raise RuntimeError("Failed to encode face thumbnail")
     return jpg.tobytes()
@@ -301,10 +335,12 @@ class FindMeWorker:
         self.face_app.prepare(ctx_id=0, det_size=(640, 640))
 
         self._last_cleanup_ts = 0.0
+        self._session = _requests_session()
 
         logger.info(
-            "Worker initialized. Poll=%ss | DBSCAN eps=%s min_samples=%s | bucket=%s | merge centroid=%s bestpair=%s | max_photos=%s | retention_days=%s",
+            "Worker initialized. Poll=%ss | ClaimBatch=%s | DBSCAN eps=%s min_samples=%s | bucket=%s | merge centroid=%s bestpair=%s | max_photos=%s | retention_days=%s | stale_job_min=%s | delete_zip_after_ingest=%s | thumb_q=%s",
             POLL_SECONDS,
+            CLAIM_BATCH,
             DBSCAN_EPS,
             DBSCAN_MIN_SAMPLES,
             SUPABASE_PUBLIC_BUCKET,
@@ -312,20 +348,73 @@ class FindMeWorker:
             MERGE_BESTPAIR_COS,
             MAX_PHOTOS_PER_ALBUM,
             ALBUM_RETENTION_DAYS,
+            JOB_STALE_MINUTES,
+            DELETE_ZIP_AFTER_INGEST,
+            THUMB_JPEG_QUALITY,
         )
 
     # -----------------------
     # DB ops
     # -----------------------
     def fetch_pending_jobs(self) -> List[dict]:
-        resp = (
-            self.sb.table("jobs")
-            .select("*")
-            .eq("status", "pending")
-            .limit(5)
-            .execute()
+        # IMPORTANT: we only "consider" pending jobs here.
+        # Actual lock happens in claim_job().
+        resp = with_retry(
+            lambda: (
+                self.sb.table("jobs")
+                .select("*")
+                .eq("status", "pending")
+                .order("created_at", desc=False)
+                .limit(CLAIM_BATCH)
+                .execute()
+            )
         )
         return resp.data or []
+
+    def claim_job(self, job_id: str) -> bool:
+        """
+        Atomic-ish claim: update status to processing ONLY if status is pending.
+        This prevents multiple workers from processing same job.
+        """
+        now = utc_now_iso()
+
+        def _do():
+            return (
+                self.sb.table("jobs")
+                .update({"status": "processing", "updated_at": now})
+                .eq("id", job_id)
+                .eq("status", "pending")
+                .execute()
+            )
+
+        resp = with_retry(_do)
+        data = resp.data or []
+        return len(data) > 0
+
+    def requeue_stale_processing_jobs(self) -> None:
+        """
+        If a worker dies mid-job, that job can be stuck in processing forever.
+        We requeue jobs whose updated_at is older than cutoff.
+        """
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=JOB_STALE_MINUTES)
+        cutoff_iso = cutoff.isoformat()
+
+        def _do():
+            return (
+                self.sb.table("jobs")
+                .update({"status": "pending", "updated_at": utc_now_iso(), "error": "requeued_stale_processing"})
+                .eq("status", "processing")
+                .lt("updated_at", cutoff_iso)
+                .execute()
+            )
+
+        try:
+            resp = with_retry(_do)
+            n = len(resp.data or [])
+            if n > 0:
+                logger.warning("Requeued stale jobs: %s (cutoff=%s)", n, cutoff_iso)
+        except Exception as e:
+            logger.warning("Failed to requeue stale jobs (non-fatal): %s", str(e))
 
     def mark_job(self, job_id: str, status: str, result: Optional[dict] = None, error: Optional[str] = None) -> None:
         payload: Dict[str, Any] = {"status": status, "updated_at": utc_now_iso()}
@@ -333,7 +422,8 @@ class FindMeWorker:
             payload["result"] = json.dumps(result)
         if error:
             payload["error"] = error[:1500]
-        self.sb.table("jobs").update(payload).eq("id", job_id).execute()
+
+        with_retry(lambda: self.sb.table("jobs").update(payload).eq("id", job_id).execute())
 
     def update_album(
         self,
@@ -355,36 +445,38 @@ class FindMeWorker:
         if completed:
             payload["completed_at"] = utc_now_iso()
 
-        self.sb.table("albums").update(payload).eq("id", album_id).execute()
+        with_retry(lambda: self.sb.table("albums").update(payload).eq("id", album_id).execute())
 
     def fetch_photos(self, album_id: str) -> List[dict]:
-        resp = (
-            self.sb.table("photos")
-            .select("id, storage_path")
-            .eq("album_id", album_id)
-            .execute()
+        resp = with_retry(
+            lambda: (
+                self.sb.table("photos")
+                .select("id, storage_path")
+                .eq("album_id", album_id)
+                .execute()
+            )
         )
         return resp.data or []
 
     def clear_job_embeddings(self, job_id: str) -> None:
         # legacy table (dejamos limpio igual)
-        self.sb.table("photo_embeddings").delete().eq("job_id", job_id).execute()
+        with_retry(lambda: self.sb.table("photo_embeddings").delete().eq("job_id", job_id).execute())
 
     def clear_album_face_embeddings(self, album_id: str) -> None:
-        self.sb.table("face_embeddings").delete().eq("album_id", album_id).execute()
+        with_retry(lambda: self.sb.table("face_embeddings").delete().eq("album_id", album_id).execute())
 
     def clear_album_clusters(self, album_id: str) -> None:
-        self.sb.table("face_clusters").delete().eq("album_id", album_id).execute()
+        with_retry(lambda: self.sb.table("face_clusters").delete().eq("album_id", album_id).execute())
 
     def clear_photo_faces_for_album(self, album_id: str) -> None:
         photos = self.fetch_photos(album_id)
         for p in photos:
-            self.sb.table("photo_faces").delete().eq("photo_id", p["id"]).execute()
+            with_retry(lambda pid=p["id"]: self.sb.table("photo_faces").delete().eq("photo_id", pid).execute())
 
     def create_cluster(self, album_id: str, thumbnail_url: Optional[str]) -> str:
-        resp = self.sb.table("face_clusters").insert(
-            {"album_id": album_id, "thumbnail_url": thumbnail_url}
-        ).execute()
+        resp = with_retry(
+            lambda: self.sb.table("face_clusters").insert({"album_id": album_id, "thumbnail_url": thumbnail_url}).execute()
+        )
         data = resp.data or []
         if not data:
             raise RuntimeError("Could not create face_cluster")
@@ -395,28 +487,42 @@ class FindMeWorker:
         Multifaces: una foto puede estar en múltiples clusters.
         Upsert por PK compuesta (photo_id, cluster_id).
         """
-        self.sb.table("photo_faces").upsert(
-            {"photo_id": photo_id, "cluster_id": cluster_id},
-            on_conflict="photo_id,cluster_id",
-        ).execute()
+        with_retry(
+            lambda: self.sb.table("photo_faces").upsert(
+                {"photo_id": photo_id, "cluster_id": cluster_id},
+                on_conflict="photo_id,cluster_id",
+            ).execute()
+        )
 
-    def insert_face_embedding_row(self, face_id: str, photo_id: str, album_id: str, embedding: List[float], bbox: List[float]) -> None:
-        self.sb.table("face_embeddings").insert(
-            {
-                "id": face_id,
-                "photo_id": photo_id,
-                "album_id": album_id,
-                "embedding": embedding,
-                "bbox": bbox,
-            }
-        ).execute()
+    def insert_face_embedding_row(
+        self,
+        face_id: str,
+        photo_id: str,
+        album_id: str,
+        embedding: List[float],
+        bbox: List[float],
+    ) -> None:
+        with_retry(
+            lambda: self.sb.table("face_embeddings").insert(
+                {
+                    "id": face_id,
+                    "photo_id": photo_id,
+                    "album_id": album_id,
+                    "embedding": embedding,
+                    "bbox": bbox,
+                }
+            ).execute()
+        )
 
     def upload_bytes(self, storage_path: str, raw: bytes, content_type: str) -> None:
-        up_res = self.sb.storage.from_(SUPABASE_PUBLIC_BUCKET).upload(
-            path=storage_path,
-            file=raw,
-            file_options={"content-type": content_type},
-        )
+        def _do():
+            return self.sb.storage.from_(SUPABASE_PUBLIC_BUCKET).upload(
+                path=storage_path,
+                file=raw,
+                file_options={"content-type": content_type},
+            )
+
+        up_res = with_retry(_do)
         if getattr(up_res, "error", None):
             raise RuntimeError(f"Storage upload failed for {storage_path}: {up_res.error}")
 
@@ -424,15 +530,14 @@ class FindMeWorker:
         paths = [p for p in paths if p]
         if not paths:
             return
-        # Supabase storage remove acepta lista de paths
-        self.sb.storage.from_(SUPABASE_PUBLIC_BUCKET).remove(paths)
+        with_retry(lambda: self.sb.storage.from_(SUPABASE_PUBLIC_BUCKET).remove(paths))
 
     # -----------------------
     # ZIP ingest
     # -----------------------
     def download_zip_bytes(self, zip_path: str) -> bytes:
         url = to_public_storage_url(zip_path)
-        r = requests.get(url, timeout=HTTP_TIMEOUT_SECONDS)
+        r = self._session.get(url, timeout=HTTP_TIMEOUT_SECONDS)
         r.raise_for_status()
         return r.content
 
@@ -468,15 +573,18 @@ class FindMeWorker:
 
             self.upload_bytes(storage_path=storage_path, raw=raw, content_type=content_type)
 
-            ins = self.sb.table("photos").insert(
-                {"id": photo_id, "album_id": album_id, "storage_path": storage_path}
-            ).execute()
+            ins = with_retry(
+                lambda: self.sb.table("photos").insert(
+                    {"id": photo_id, "album_id": album_id, "storage_path": storage_path}
+                ).execute()
+            )
             if getattr(ins, "error", None):
                 raise RuntimeError(f"DB insert into photos failed: {ins.error}")
 
             inserted += 1
 
-        self.sb.table("albums").update({"photo_count": inserted}).eq("id", album_id).execute()
+        self.update_album(album_id, status="processing", progress=5)
+        with_retry(lambda: self.sb.table("albums").update({"photo_count": inserted}).eq("id", album_id).execute())
         return inserted
 
     # -----------------------
@@ -485,7 +593,7 @@ class FindMeWorker:
     def delete_album_everywhere(self, album_id: str) -> None:
         """
         Borrado hard:
-        - Storage: fotos + thumbs
+        - Storage: fotos + thumbs + zip original (si existe)
         - DB: photo_faces, face_embeddings, face_clusters, photos, jobs, albums
         """
         album_id = str(album_id)
@@ -493,47 +601,47 @@ class FindMeWorker:
 
         # storage paths for photos
         photos = (
-            self.sb.table("photos")
-            .select("id,storage_path")
-            .eq("album_id", album_id)
-            .execute()
+            with_retry(lambda: self.sb.table("photos").select("id,storage_path").eq("album_id", album_id).execute())
         ).data or []
 
         photo_paths = [p.get("storage_path") for p in photos if p.get("storage_path")]
         self.remove_paths(photo_paths)
 
-        # face thumbs: derivamos por face_embeddings.id (si existen)
+        # face thumbs: derivamos por face_embeddings.id
         faces = (
-            self.sb.table("face_embeddings")
-            .select("id")
-            .eq("album_id", album_id)
-            .execute()
+            with_retry(lambda: self.sb.table("face_embeddings").select("id").eq("album_id", album_id).execute())
         ).data or []
         face_thumb_paths = [f"albums/{album_id}/faces/{r['id']}.jpg" for r in faces if r.get("id")]
         self.remove_paths(face_thumb_paths)
 
+        # zip original (si existe)
+        alb = with_retry(lambda: self.sb.table("albums").select("upload_key").eq("id", album_id).execute())
+        if not getattr(alb, "error", None) and alb.data and alb.data[0].get("upload_key"):
+            self.remove_paths([alb.data[0]["upload_key"]])
+
         # DB cleanup (orden: dependencias primero)
         photo_ids = [p.get("id") for p in photos if p.get("id")]
         for pid in photo_ids:
-            self.sb.table("photo_faces").delete().eq("photo_id", pid).execute()
+            with_retry(lambda _pid=pid: self.sb.table("photo_faces").delete().eq("photo_id", _pid).execute())
 
-        self.sb.table("face_embeddings").delete().eq("album_id", album_id).execute()
-        self.sb.table("face_clusters").delete().eq("album_id", album_id).execute()
-        self.sb.table("photos").delete().eq("album_id", album_id).execute()
-        self.sb.table("jobs").delete().eq("album_id", album_id).execute()
-        self.sb.table("albums").delete().eq("id", album_id).execute()
+        with_retry(lambda: self.sb.table("face_embeddings").delete().eq("album_id", album_id).execute())
+        with_retry(lambda: self.sb.table("face_clusters").delete().eq("album_id", album_id).execute())
+        with_retry(lambda: self.sb.table("photos").delete().eq("album_id", album_id).execute())
+        with_retry(lambda: self.sb.table("jobs").delete().eq("album_id", album_id).execute())
+        with_retry(lambda: self.sb.table("albums").delete().eq("id", album_id).execute())
 
     def cleanup_old_albums(self) -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(days=ALBUM_RETENTION_DAYS)
 
-        # Solo borrar álbumes completados o en error, para no matar un processing.
-        resp = (
-            self.sb.table("albums")
-            .select("id,status,created_at")
-            .lt("created_at", cutoff.isoformat())
-            .in_("status", ["completed", "error"])
-            .limit(200)
-            .execute()
+        resp = with_retry(
+            lambda: (
+                self.sb.table("albums")
+                .select("id,status,created_at")
+                .lt("created_at", cutoff.isoformat())
+                .in_("status", ["completed", "error"])
+                .limit(200)
+                .execute()
+            )
         )
         rows = resp.data or []
         if not rows:
@@ -562,29 +670,27 @@ class FindMeWorker:
 
         album_id = str(album_id)
 
-        self.mark_job(job_id, "processing")
+        # Album state
         self.update_album(album_id, status="processing", progress=1, error_message=None, completed=False)
 
         try:
             photos = self.fetch_photos(album_id)
 
             # Si API no creó photos, ingerimos ZIP
+            zip_path = str(job.get("zip_path") or "")
             if not photos:
-                zip_path = job.get("zip_path")
                 if not zip_path:
                     raise RuntimeError("No photos found and missing jobs.zip_path to ingest")
 
                 logger.info("No photos rows for album %s. Ingesting ZIP zip_path=%s", album_id, zip_path)
                 self.update_album(album_id, status="processing", progress=2)
 
-                added = self.ingest_zip_to_photos(album_id=album_id, zip_path=str(zip_path))
+                added = self.ingest_zip_to_photos(album_id=album_id, zip_path=zip_path)
                 logger.info("ZIP ingest done. photos_added=%s album_id=%s", added, album_id)
 
                 photos = self.fetch_photos(album_id)
                 if not photos:
                     raise RuntimeError("ZIP ingest ran but photos table is still empty for this album")
-
-                self.update_album(album_id, status="processing", progress=5)
 
             total_photos = len(photos)
             if total_photos > MAX_PHOTOS_PER_ALBUM:
@@ -611,7 +717,7 @@ class FindMeWorker:
                 url = to_public_storage_url(storage_path)
 
                 try:
-                    img = download_image(url)
+                    img = download_image(self._session, url)
                     faces = self.face_app.get(img) or []
 
                     faces = [
@@ -644,9 +750,7 @@ class FindMeWorker:
                             bbox=bbox,
                         )
 
-                        faces_rows.append(
-                            {"face_id": face_id, "photo_id": photo_id, "embedding": emb}
-                        )
+                        faces_rows.append({"face_id": face_id, "photo_id": photo_id, "embedding": emb})
                         faces_total += 1
 
                 except Exception as e:
@@ -704,6 +808,14 @@ class FindMeWorker:
                 prog_int = clamp_int(int(round(70 + prog_ratio * 25)), 70, 95)
                 self.update_album(album_id, status="processing", progress=prog_int)
 
+            # Cost control: optionally delete original ZIP after we've ingested photos successfully
+            if DELETE_ZIP_AFTER_INGEST and zip_path:
+                try:
+                    self.remove_paths([zip_path])
+                    logger.info("Deleted original ZIP after ingest: %s", zip_path)
+                except Exception as e:
+                    logger.warning("Failed to delete original ZIP (non-fatal): %s", str(e))
+
             result = {
                 "album_id": album_id,
                 "photos_total": total_photos,
@@ -723,6 +835,11 @@ class FindMeWorker:
                     "max_photos_per_album": MAX_PHOTOS_PER_ALBUM,
                     "retention_days": ALBUM_RETENTION_DAYS,
                 },
+                "cost_controls": {
+                    "delete_zip_after_ingest": DELETE_ZIP_AFTER_INGEST,
+                    "thumb_jpeg_quality": THUMB_JPEG_QUALITY,
+                    "face_thumb_size": FACE_THUMB_SIZE,
+                },
             }
 
             self.update_album(album_id, status="completed", progress=100, completed=True)
@@ -731,8 +848,15 @@ class FindMeWorker:
 
         except Exception as e:
             logger.exception("Job failed %s", job_id)
-            self.update_album(album_id, status="error", progress=0, error_message=str(e), completed=False)
-            self.mark_job(job_id, "error", error=str(e))
+            # try to mark album+job error, but keep worker alive even if supabase is flaky
+            try:
+                self.update_album(album_id, status="error", progress=0, error_message=str(e), completed=False)
+            except Exception as ee:
+                logger.warning("Failed to update album error state (non-fatal): %s", str(ee))
+            try:
+                self.mark_job(job_id, "error", error=str(e))
+            except Exception as ee:
+                logger.warning("Failed to mark job error state (non-fatal): %s", str(ee))
 
     def run_forever(self) -> None:
         while True:
@@ -746,10 +870,23 @@ class FindMeWorker:
                     except Exception:
                         logger.exception("Cleanup loop error (will continue)")
 
+                # reliability: requeue stale processing jobs (enables horizontal workers safely)
+                self.requeue_stale_processing_jobs()
+
                 jobs = self.fetch_pending_jobs()
                 if jobs:
-                    logger.info("Pending jobs: %s", len(jobs))
+                    logger.info("Pending jobs (considered): %s", len(jobs))
+
                 for j in jobs:
+                    job_id = str(j.get("id"))
+                    if not job_id:
+                        continue
+
+                    # Claim lock: only one worker will succeed
+                    if not self.claim_job(job_id):
+                        continue
+
+                    # process claimed job
                     self.process_job(j)
 
             except Exception:
