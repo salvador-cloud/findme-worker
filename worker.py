@@ -7,15 +7,13 @@ import zipfile
 import random
 from uuid import uuid4
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional, Dict, Any, Callable, TypeVar
+from typing import List, Optional, Dict, Any, Callable, TypeVar, Tuple
 
 import numpy as np
 import requests
 import cv2
 
 import redis
-from rq import Worker, Queue, Connection
-from rq.job import Job
 
 from supabase import create_client, Client
 from insightface.app import FaceAnalysis
@@ -38,20 +36,17 @@ logger = logging.getLogger("findme-worker")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
-# Redis / RQ
+# Redis queue (list-based)
 REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 RQ_QUEUE_NAME = os.environ.get("RQ_QUEUE_NAME", "findme").strip()
 
-# Burst-loop knobs (Upstash friendly)
-RQ_BURST_SLEEP_SECONDS = int(os.environ.get("RQ_BURST_SLEEP_SECONDS", "2"))
+# Loop knobs (Upstash friendly)
+WORKER_POLL_TIMEOUT_SECONDS = int(os.environ.get("WORKER_POLL_TIMEOUT_SECONDS", "5"))
+WORKER_IDLE_SLEEP_SECONDS = float(os.environ.get("WORKER_IDLE_SLEEP_SECONDS", "0.2"))
+
 REDIS_SOCKET_TIMEOUT = int(os.environ.get("REDIS_SOCKET_TIMEOUT", "10"))
 REDIS_SOCKET_CONNECT_TIMEOUT = int(os.environ.get("REDIS_SOCKET_CONNECT_TIMEOUT", "10"))
 REDIS_HEALTH_CHECK_INTERVAL = int(os.environ.get("REDIS_HEALTH_CHECK_INTERVAL", "15"))
-
-# RQ reliability knobs
-RQ_JOB_TIMEOUT_SECONDS = int(os.environ.get("RQ_JOB_TIMEOUT_SECONDS", "1800"))   # 30m
-RQ_RESULT_TTL_SECONDS = int(os.environ.get("RQ_RESULT_TTL_SECONDS", "3600"))     # 1h
-RQ_FAILURE_TTL_SECONDS = int(os.environ.get("RQ_FAILURE_TTL_SECONDS", "86400"))  # 1d
 
 # DBSCAN tuning
 DBSCAN_EPS = float(os.environ.get("DBSCAN_EPS", "0.35"))
@@ -76,7 +71,7 @@ MAX_PHOTOS_PER_ALBUM = int(os.environ.get("MAX_PHOTOS_PER_ALBUM", "500"))
 ALBUM_RETENTION_DAYS = int(os.environ.get("ALBUM_RETENTION_DAYS", "7"))
 CLEANUP_EVERY_SECONDS = int(os.environ.get("CLEANUP_EVERY_SECONDS", "3600"))  # 1h
 
-# Requeue stale processing jobs (still useful even with RQ)
+# Requeue stale processing jobs
 JOB_STALE_MINUTES = int(os.environ.get("JOB_STALE_MINUTES", "30"))
 
 # Cost controls
@@ -334,9 +329,11 @@ class FindMeWorker:
         self._session = _requests_session()
 
         logger.info(
-            "Worker initialized (RQ). queue=%s | job_timeout=%ss | bucket=%s | dbscan eps=%s min_samples=%s | merge centroid=%s bestpair=%s | max_photos=%s | retention_days=%s | stale_job_min=%s | delete_zip_after_ingest=%s | thumb_q=%s",
+            "Worker initialized (Redis list). queue=%s | redis_key=%s | poll_timeout=%ss | idle_sleep=%ss | bucket=%s | dbscan eps=%s min_samples=%s | merge centroid=%s bestpair=%s | max_photos=%s | retention_days=%s | stale_job_min=%s | delete_zip_after_ingest=%s | thumb_q=%s",
             RQ_QUEUE_NAME,
-            RQ_JOB_TIMEOUT_SECONDS,
+            f"rq:queue:{RQ_QUEUE_NAME}",
+            WORKER_POLL_TIMEOUT_SECONDS,
+            WORKER_IDLE_SLEEP_SECONDS,
             SUPABASE_PUBLIC_BUCKET,
             DBSCAN_EPS,
             DBSCAN_MIN_SAMPLES,
@@ -820,7 +817,7 @@ class FindMeWorker:
 
 
 # -----------------------
-# RQ entrypoint: consume job_id from Redis, then process via Supabase
+# Entrypoint: consume job_id from Redis list and process via Supabase
 # -----------------------
 _worker_singleton: Optional[FindMeWorker] = None
 
@@ -834,12 +831,11 @@ def _get_worker() -> FindMeWorker:
 
 def process_job_id(job_id: str) -> None:
     """
-    This is the function executed by RQ.
-    It receives a job_id (string) from Redis, loads job row from DB, claims it, and processes it.
+    Receives a job_id (string), loads job row from DB, claims it, and processes it.
     """
     w = _get_worker()
 
-    # periodic cleanup + stale requeue (cheap, keeps system healthy)
+    # periodic cleanup + stale requeue
     now_ts = time.time()
     if not hasattr(w, "_last_cleanup_ts"):
         w._last_cleanup_ts = 0.0  # type: ignore
@@ -882,47 +878,31 @@ def main() -> None:
         health_check_interval=REDIS_HEALTH_CHECK_INTERVAL,
     )
 
+    redis_key = f"rq:queue:{RQ_QUEUE_NAME}"
+
     logger.info(
-        "RQ worker boot (burst-loop). queue=%s redis=%s sleep=%ss timeouts=(%s/%s)",
+        "Worker boot (redis-list). queue=%s redis_key=%s poll_timeout=%ss timeouts=(%s/%s)",
         RQ_QUEUE_NAME,
-        "configured",
-        RQ_BURST_SLEEP_SECONDS,
+        redis_key,
+        WORKER_POLL_TIMEOUT_SECONDS,
         REDIS_SOCKET_CONNECT_TIMEOUT,
         REDIS_SOCKET_TIMEOUT,
     )
 
-    # Upstash/serverless-friendly pattern:
-    # - connect
-    # - process what's available (burst=True)
-    # - exit work loop
-    # - sleep
-    # - repeat
     while True:
         try:
-            with Connection(redis_conn):
-                q = Queue(
-                    RQ_QUEUE_NAME,
-                    default_timeout=RQ_JOB_TIMEOUT_SECONDS,
-                )
+            # BLPOP returns (key, value) or None on timeout
+            item: Optional[Tuple[str, str]] = redis_conn.blpop(redis_key, timeout=WORKER_POLL_TIMEOUT_SECONDS)
+            if not item:
+                time.sleep(WORKER_IDLE_SLEEP_SECONDS)
+                continue
 
-                w = Worker(
-                    [q],
-                    connection=redis_conn,
-                    default_worker_ttl=420,
-                    job_monitoring_interval=30,
-                    log_job_description=False,
-                )
+            _, job_id = item
+            process_job_id(job_id)
 
-                # burst=True => no long-lived listen connection (prevents Upstash idle-kill)
-                w.work(
-                    burst=True,
-                    with_scheduler=False,
-                    logging_level=logging.INFO,
-                )
         except Exception as e:
-            logger.exception("RQ burst loop error (will continue): %s", str(e))
-
-        time.sleep(RQ_BURST_SLEEP_SECONDS)
+            logger.exception("Worker loop error (will continue): %s", str(e))
+            time.sleep(1.0)
 
 
 if __name__ == "__main__":
