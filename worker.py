@@ -1,6 +1,6 @@
 import os
-import time
 import json
+import time
 import logging
 import io
 import zipfile
@@ -12,6 +12,10 @@ from typing import List, Optional, Dict, Any, Callable, TypeVar
 import numpy as np
 import requests
 import cv2
+
+import redis
+from rq import Worker, Queue, Connection
+from rq.job import Job
 
 from supabase import create_client, Client
 from insightface.app import FaceAnalysis
@@ -34,7 +38,14 @@ logger = logging.getLogger("findme-worker")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "10"))
+# Redis / RQ
+REDIS_URL = os.environ.get("REDIS_URL", "").strip()
+RQ_QUEUE_NAME = os.environ.get("RQ_QUEUE_NAME", "findme").strip()
+
+# RQ reliability knobs
+RQ_JOB_TIMEOUT_SECONDS = int(os.environ.get("RQ_JOB_TIMEOUT_SECONDS", "1800"))  # 30m
+RQ_RESULT_TTL_SECONDS = int(os.environ.get("RQ_RESULT_TTL_SECONDS", "3600"))   # 1h
+RQ_FAILURE_TTL_SECONDS = int(os.environ.get("RQ_FAILURE_TTL_SECONDS", "86400")) # 1d
 
 # DBSCAN tuning
 DBSCAN_EPS = float(os.environ.get("DBSCAN_EPS", "0.35"))
@@ -54,14 +65,13 @@ MERGE_CENTROID_COS = float(os.environ.get("MERGE_CENTROID_COS", "0.60"))
 MERGE_BESTPAIR_COS = float(os.environ.get("MERGE_BESTPAIR_COS", "0.70"))
 MAX_FACES_PER_CLUSTER_FOR_PAIRWISE = int(os.environ.get("MAX_FACES_PER_CLUSTER_FOR_PAIRWISE", "40"))
 
-# P0 guards
+# Guards / retention
 MAX_PHOTOS_PER_ALBUM = int(os.environ.get("MAX_PHOTOS_PER_ALBUM", "500"))
 ALBUM_RETENTION_DAYS = int(os.environ.get("ALBUM_RETENTION_DAYS", "7"))
 CLEANUP_EVERY_SECONDS = int(os.environ.get("CLEANUP_EVERY_SECONDS", "3600"))  # 1h
 
-# P2-ish reliability / scale (still DB-poll based, but safe for multiple workers)
-JOB_STALE_MINUTES = int(os.environ.get("JOB_STALE_MINUTES", "30"))  # requeue if processing too long
-CLAIM_BATCH = int(os.environ.get("CLAIM_BATCH", "5"))  # how many pending jobs to consider per poll
+# Requeue stale processing jobs (still useful even with RQ)
+JOB_STALE_MINUTES = int(os.environ.get("JOB_STALE_MINUTES", "30"))
 
 # Cost controls
 DELETE_ZIP_AFTER_INGEST = os.environ.get("DELETE_ZIP_AFTER_INGEST", "0").strip() in ("1", "true", "True", "yes", "YES")
@@ -119,7 +129,6 @@ def with_retry(fn: Callable[[], T], *, tries: int = 4, base_sleep: float = 0.35)
             return fn()
         except Exception as e:
             last_exc = e
-            # exponential backoff + jitter
             sleep_s = base_sleep * (2 ** attempt) + random.uniform(0.0, 0.2)
             logger.warning("Retryable error (attempt %s/%s): %s", attempt + 1, tries, str(e))
             time.sleep(sleep_s)
@@ -127,10 +136,9 @@ def with_retry(fn: Callable[[], T], *, tries: int = 4, base_sleep: float = 0.35)
     raise last_exc
 
 
-# --- requests session with basic retry (for storage fetches) ---
+# --- requests session ---
 def _requests_session() -> requests.Session:
-    s = requests.Session()
-    return s
+    return requests.Session()
 
 
 def download_image(session: requests.Session, url: str) -> np.ndarray:
@@ -156,10 +164,6 @@ def run_dbscan(embeddings: np.ndarray) -> np.ndarray:
 
 
 def crop_face_thumb(img_bgr: np.ndarray, bbox: List[float]) -> bytes:
-    """
-    Recorta cara usando bbox [x1,y1,x2,y2] con padding.
-    Devuelve JPG bytes.
-    """
     h, w = img_bgr.shape[:2]
     x1, y1, x2, y2 = [float(x) for x in bbox]
     bw = max(1.0, x2 - x1)
@@ -178,7 +182,6 @@ def crop_face_thumb(img_bgr: np.ndarray, bbox: List[float]) -> bytes:
 
     crop = img_bgr[yy1:yy2, xx1:xx2].copy()
 
-    # resize to stable size (max side = FACE_THUMB_SIZE)
     ch, cw = crop.shape[:2]
     mx = max(ch, cw)
     if mx > FACE_THUMB_SIZE:
@@ -210,10 +213,6 @@ def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def build_clusters_from_labels(faces_rows: List[Dict[str, Any]], labels: np.ndarray) -> Dict[int, List[int]]:
-    """
-    label -> list of indices in faces_rows
-    (solo labels != -1)
-    """
     clusters: Dict[int, List[int]] = {}
     for idx, lab in enumerate(labels.tolist()):
         lab_int = int(lab)
@@ -229,10 +228,6 @@ def compute_centroid(embs: np.ndarray, idxs: List[int]) -> np.ndarray:
 
 
 def best_pair_cosine(embs: np.ndarray, idxs_a: List[int], idxs_b: List[int]) -> float:
-    """
-    Máxima similitud entre cualquier embedding de A y cualquiera de B.
-    Submuestrea para no explotar CPU.
-    """
     a = idxs_a[:MAX_FACES_PER_CLUSTER_FOR_PAIRWISE]
     b = idxs_b[:MAX_FACES_PER_CLUSTER_FOR_PAIRWISE]
     best = -1.0
@@ -255,10 +250,6 @@ def merge_clusters(
     embs: np.ndarray,
     labels: np.ndarray,
 ) -> np.ndarray:
-    """
-    Une clusters DBSCAN si parecen la misma persona.
-    Anti-merge: si dos clusters aparecen en la MISMA foto => no pueden ser la misma persona.
-    """
     clusters = build_clusters_from_labels(faces_rows, labels)
     if len(clusters) <= 1:
         return labels
@@ -321,7 +312,7 @@ def merge_clusters(
 
 
 # -----------------------
-# Core worker
+# Worker core (logic intact)
 # -----------------------
 class FindMeWorker:
     def __init__(self) -> None:
@@ -330,7 +321,6 @@ class FindMeWorker:
 
         self.sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-        # InsightFace init (CPU)
         self.face_app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
         self.face_app.prepare(ctx_id=0, det_size=(640, 640))
 
@@ -338,12 +328,12 @@ class FindMeWorker:
         self._session = _requests_session()
 
         logger.info(
-            "Worker initialized. Poll=%ss | ClaimBatch=%s | DBSCAN eps=%s min_samples=%s | bucket=%s | merge centroid=%s bestpair=%s | max_photos=%s | retention_days=%s | stale_job_min=%s | delete_zip_after_ingest=%s | thumb_q=%s",
-            POLL_SECONDS,
-            CLAIM_BATCH,
+            "Worker initialized (RQ). queue=%s | job_timeout=%ss | bucket=%s | dbscan eps=%s min_samples=%s | merge centroid=%s bestpair=%s | max_photos=%s | retention_days=%s | stale_job_min=%s | delete_zip_after_ingest=%s | thumb_q=%s",
+            RQ_QUEUE_NAME,
+            RQ_JOB_TIMEOUT_SECONDS,
+            SUPABASE_PUBLIC_BUCKET,
             DBSCAN_EPS,
             DBSCAN_MIN_SAMPLES,
-            SUPABASE_PUBLIC_BUCKET,
             MERGE_CENTROID_COS,
             MERGE_BESTPAIR_COS,
             MAX_PHOTOS_PER_ALBUM,
@@ -356,26 +346,7 @@ class FindMeWorker:
     # -----------------------
     # DB ops
     # -----------------------
-    def fetch_pending_jobs(self) -> List[dict]:
-        # IMPORTANT: we only "consider" pending jobs here.
-        # Actual lock happens in claim_job().
-        resp = with_retry(
-            lambda: (
-                self.sb.table("jobs")
-                .select("*")
-                .eq("status", "pending")
-                .order("created_at", desc=False)
-                .limit(CLAIM_BATCH)
-                .execute()
-            )
-        )
-        return resp.data or []
-
     def claim_job(self, job_id: str) -> bool:
-        """
-        Atomic-ish claim: update status to processing ONLY if status is pending.
-        This prevents multiple workers from processing same job.
-        """
         now = utc_now_iso()
 
         def _do():
@@ -392,10 +363,6 @@ class FindMeWorker:
         return len(data) > 0
 
     def requeue_stale_processing_jobs(self) -> None:
-        """
-        If a worker dies mid-job, that job can be stuck in processing forever.
-        We requeue jobs whose updated_at is older than cutoff.
-        """
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=JOB_STALE_MINUTES)
         cutoff_iso = cutoff.isoformat()
 
@@ -416,13 +383,25 @@ class FindMeWorker:
         except Exception as e:
             logger.warning("Failed to requeue stale jobs (non-fatal): %s", str(e))
 
+    def fetch_job_row(self, job_id: str) -> Optional[dict]:
+        resp = with_retry(
+            lambda: (
+                self.sb.table("jobs")
+                .select("*")
+                .eq("id", job_id)
+                .limit(1)
+                .execute()
+            )
+        )
+        rows = resp.data or []
+        return rows[0] if rows else None
+
     def mark_job(self, job_id: str, status: str, result: Optional[dict] = None, error: Optional[str] = None) -> None:
         payload: Dict[str, Any] = {"status": status, "updated_at": utc_now_iso()}
         if result is not None:
             payload["result"] = json.dumps(result)
         if error:
             payload["error"] = error[:1500]
-
         with_retry(lambda: self.sb.table("jobs").update(payload).eq("id", job_id).execute())
 
     def update_album(
@@ -459,7 +438,6 @@ class FindMeWorker:
         return resp.data or []
 
     def clear_job_embeddings(self, job_id: str) -> None:
-        # legacy table (dejamos limpio igual)
         with_retry(lambda: self.sb.table("photo_embeddings").delete().eq("job_id", job_id).execute())
 
     def clear_album_face_embeddings(self, album_id: str) -> None:
@@ -483,10 +461,6 @@ class FindMeWorker:
         return data[0]["id"]
 
     def upsert_photo_face(self, photo_id: str, cluster_id: str) -> None:
-        """
-        Multifaces: una foto puede estar en múltiples clusters.
-        Upsert por PK compuesta (photo_id, cluster_id).
-        """
         with_retry(
             lambda: self.sb.table("photo_faces").upsert(
                 {"photo_id": photo_id, "cluster_id": cluster_id},
@@ -588,18 +562,12 @@ class FindMeWorker:
         return inserted
 
     # -----------------------
-    # Album deletion (for retention)
+    # Retention cleanup
     # -----------------------
     def delete_album_everywhere(self, album_id: str) -> None:
-        """
-        Borrado hard:
-        - Storage: fotos + thumbs + zip original (si existe)
-        - DB: photo_faces, face_embeddings, face_clusters, photos, jobs, albums
-        """
         album_id = str(album_id)
         logger.info("Deleting album everywhere album_id=%s", album_id)
 
-        # storage paths for photos
         photos = (
             with_retry(lambda: self.sb.table("photos").select("id,storage_path").eq("album_id", album_id).execute())
         ).data or []
@@ -607,19 +575,16 @@ class FindMeWorker:
         photo_paths = [p.get("storage_path") for p in photos if p.get("storage_path")]
         self.remove_paths(photo_paths)
 
-        # face thumbs: derivamos por face_embeddings.id
         faces = (
             with_retry(lambda: self.sb.table("face_embeddings").select("id").eq("album_id", album_id).execute())
         ).data or []
         face_thumb_paths = [f"albums/{album_id}/faces/{r['id']}.jpg" for r in faces if r.get("id")]
         self.remove_paths(face_thumb_paths)
 
-        # zip original (si existe)
         alb = with_retry(lambda: self.sb.table("albums").select("upload_key").eq("id", album_id).execute())
         if not getattr(alb, "error", None) and alb.data and alb.data[0].get("upload_key"):
             self.remove_paths([alb.data[0]["upload_key"]])
 
-        # DB cleanup (orden: dependencias primero)
         photo_ids = [p.get("id") for p in photos if p.get("id")]
         for pid in photo_ids:
             with_retry(lambda _pid=pid: self.sb.table("photo_faces").delete().eq("photo_id", _pid).execute())
@@ -632,7 +597,6 @@ class FindMeWorker:
 
     def cleanup_old_albums(self) -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(days=ALBUM_RETENTION_DAYS)
-
         resp = with_retry(
             lambda: (
                 self.sb.table("albums")
@@ -656,7 +620,7 @@ class FindMeWorker:
                 logger.warning("Cleanup failed album_id=%s err=%s", r.get("id"), str(e))
 
     # -----------------------
-    # Core processing
+    # Core processing (unchanged)
     # -----------------------
     def process_job(self, job: dict) -> None:
         job_id = str(job.get("id"))
@@ -670,13 +634,11 @@ class FindMeWorker:
 
         album_id = str(album_id)
 
-        # Album state
         self.update_album(album_id, status="processing", progress=1, error_message=None, completed=False)
 
         try:
             photos = self.fetch_photos(album_id)
 
-            # Si API no creó photos, ingerimos ZIP
             zip_path = str(job.get("zip_path") or "")
             if not photos:
                 if not zip_path:
@@ -698,7 +660,6 @@ class FindMeWorker:
 
             logger.info("Album %s photos=%s", album_id, total_photos)
 
-            # Idempotencia: limpiar output previo del álbum
             self.clear_job_embeddings(job_id)
             self.clear_photo_faces_for_album(album_id)
             self.clear_album_clusters(album_id)
@@ -763,16 +724,12 @@ class FindMeWorker:
             if faces_total == 0:
                 raise RuntimeError(f"No faces detected/embedded. photos={total_photos}, photos_no_face={photos_no_face}")
 
-            # 2) Clustering por CARA
             embeddings = np.array([r["embedding"] for r in faces_rows], dtype=np.float32)
             labels = run_dbscan(embeddings)
-
-            # 2b) Merge inteligente post-DBSCAN
             labels = merge_clusters(faces_rows, embeddings, labels)
 
             self.update_album(album_id, status="processing", progress=70)
 
-            # 3) Crear clusters + asignar photo_faces
             cluster_map: Dict[int, str] = {}
             unique_labels = sorted({int(x) for x in labels.tolist() if int(x) != -1})
 
@@ -803,12 +760,10 @@ class FindMeWorker:
                     self.upsert_photo_face(photo_id=photo_id, cluster_id=cluster_id)
 
                 assigned_faces += 1
-
                 prog_ratio = (i + 1) / max(1, len(faces_rows))
                 prog_int = clamp_int(int(round(70 + prog_ratio * 25)), 70, 95)
                 self.update_album(album_id, status="processing", progress=prog_int)
 
-            # Cost control: optionally delete original ZIP after we've ingested photos successfully
             if DELETE_ZIP_AFTER_INGEST and zip_path:
                 try:
                     self.remove_paths([zip_path])
@@ -844,11 +799,10 @@ class FindMeWorker:
 
             self.update_album(album_id, status="completed", progress=100, completed=True)
             self.mark_job(job_id, "done", result=result)
-            logger.info("Job done %s result=%s", job_id, result)
+            logger.info("Job done %s", job_id)
 
         except Exception as e:
             logger.exception("Job failed %s", job_id)
-            # try to mark album+job error, but keep worker alive even if supabase is flaky
             try:
                 self.update_album(album_id, status="error", progress=0, error_message=str(e), completed=False)
             except Exception as ee:
@@ -858,46 +812,88 @@ class FindMeWorker:
             except Exception as ee:
                 logger.warning("Failed to mark job error state (non-fatal): %s", str(ee))
 
-    def run_forever(self) -> None:
-        while True:
-            try:
-                # scheduled cleanup
-                now_ts = time.time()
-                if now_ts - self._last_cleanup_ts >= CLEANUP_EVERY_SECONDS:
-                    self._last_cleanup_ts = now_ts
-                    try:
-                        self.cleanup_old_albums()
-                    except Exception:
-                        logger.exception("Cleanup loop error (will continue)")
 
-                # reliability: requeue stale processing jobs (enables horizontal workers safely)
-                self.requeue_stale_processing_jobs()
+# -----------------------
+# RQ entrypoint: consume job_id from Redis, then process via Supabase
+# -----------------------
+_worker_singleton: Optional[FindMeWorker] = None
 
-                jobs = self.fetch_pending_jobs()
-                if jobs:
-                    logger.info("Pending jobs (considered): %s", len(jobs))
 
-                for j in jobs:
-                    job_id = str(j.get("id"))
-                    if not job_id:
-                        continue
+def _get_worker() -> FindMeWorker:
+    global _worker_singleton
+    if _worker_singleton is None:
+        _worker_singleton = FindMeWorker()
+    return _worker_singleton
 
-                    # Claim lock: only one worker will succeed
-                    if not self.claim_job(job_id):
-                        continue
 
-                    # process claimed job
-                    self.process_job(j)
+def process_job_id(job_id: str) -> None:
+    """
+    This is the function executed by RQ.
+    It receives a job_id (string) from Redis, loads job row from DB, claims it, and processes it.
+    """
+    w = _get_worker()
 
-            except Exception:
-                logger.exception("Loop error (will continue)")
+    # periodic cleanup + stale requeue (cheap, keeps system healthy)
+    now_ts = time.time()
+    if not hasattr(w, "_last_cleanup_ts"):
+        w._last_cleanup_ts = 0.0  # type: ignore
+    if now_ts - w._last_cleanup_ts >= CLEANUP_EVERY_SECONDS:  # type: ignore
+        w._last_cleanup_ts = now_ts  # type: ignore
+        try:
+            w.cleanup_old_albums()
+        except Exception:
+            logger.exception("Cleanup loop error (will continue)")
+    w.requeue_stale_processing_jobs()
 
-            time.sleep(POLL_SECONDS)
+    job_id = str(job_id or "").strip()
+    if not job_id:
+        return
+
+    job_row = w.fetch_job_row(job_id)
+    if not job_row:
+        logger.warning("Job id not found in DB: %s", job_id)
+        return
+
+    # Claim lock: only one worker proceeds (horizontal safe)
+    if not w.claim_job(job_id):
+        logger.info("Job already claimed/processed by another worker: %s", job_id)
+        return
+
+    w.process_job(job_row)
 
 
 def main() -> None:
-    w = FindMeWorker()
-    w.run_forever()
+    require_env("REDIS_URL", REDIS_URL)
+    require_env("SUPABASE_URL", SUPABASE_URL)
+    require_env("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY)
+
+    redis_conn = redis.Redis.from_url(
+        REDIS_URL,
+        decode_responses=True,
+        socket_timeout=10,
+        socket_connect_timeout=10,
+        health_check_interval=30,
+    )
+
+    with Connection(redis_conn):
+        q = Queue(
+            RQ_QUEUE_NAME,
+            default_timeout=RQ_JOB_TIMEOUT_SECONDS,
+        )
+
+        logger.info("RQ worker boot. queue=%s redis=%s", RQ_QUEUE_NAME, "configured")
+
+        w = Worker(
+            [q],
+            connection=redis_conn,
+            default_worker_ttl=420,
+            job_monitoring_interval=30,
+            log_job_description=False,
+        )
+        w.work(
+            with_scheduler=False,
+            logging_level=logging.INFO,
+        )
 
 
 if __name__ == "__main__":
